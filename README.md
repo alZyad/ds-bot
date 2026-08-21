@@ -134,8 +134,13 @@ so spending more bits here preserves detail that is already gone.
 
 ## Isolated tracks
 
+**Off by default.** `MAX_SPEAKER_TRACKS` ships as `0`, which records the mix
+only and hides `/rec get-all` and `/rec get-single`. Each isolated track is
+another concurrent ffmpeg process, so this is the knob that decides whether the
+bot fits on a 1 GB host. Set it to `6` to get the behaviour described below.
+
 Alongside the mix, each speaker gets their own file while a conversation has no
-more than `MAX_SPEAKER_TRACKS` (6) distinct speakers. Distinct *speakers*, not
+more than `MAX_SPEAKER_TRACKS` distinct speakers. Distinct *speakers*, not
 channel occupants: a track only exists because somebody talked, so a 10-person
 channel where 3 people speak gets 3 tracks.
 
@@ -169,7 +174,7 @@ Every value is read from the environment (or a `.env` file); see
 | `LEAVE_GRACE` | `5.0` | Seconds to wait before leaving a channel that emptied |
 | `MAX_DISK_MB` | `1024` | The whole buffer budget, across every channel |
 | `CHUNK_SECONDS` | `60` | Chunk size, i.e. deletion granularity |
-| `MAX_SPEAKER_TRACKS` | `6` | Speakers per conversation before isolated tracks stop; `0` disables them |
+| `MAX_SPEAKER_TRACKS` | `0` | Speakers per conversation before isolated tracks stop; `0` (default) disables them, and hides `/rec get-all` and `/rec get-single` |
 | `AUDIO_BITRATE` | `64k` | AAC bitrate |
 | `MAX_UPLOAD_MB` | `9.0` | Attachment cap; the guild's real limit wins if lower |
 | `MERGE_GAP_SECONDS` | `120` | Conversations closer than this merge into one export file |

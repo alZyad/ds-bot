@@ -56,6 +56,11 @@ class RecordingBot(commands.Bot):
     # -- setup --------------------------------------------------------------
 
     async def setup_hook(self) -> None:
+        if not self.cfg.speaker_tracks_enabled:
+            # Nothing writes isolated tracks, so the commands that serve them
+            # could only ever answer "none found". Do not publish them at all.
+            for name in ("get-all", "get-single"):
+                rec_group.remove_command(name)
         self.tree.add_command(rec_group)
         removed = self.store.cleanup_parts()
         if removed:
