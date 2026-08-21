@@ -53,8 +53,10 @@ class Config:
     max_disk_mb: float = 1024.0
     chunk_seconds: float = 60.0
 
-    # per-speaker tracks
-    max_speaker_tracks: int = 6
+    # per-speaker tracks. The cap doubles as the on/off flag: 0 keeps the mix
+    # only, which is one ffmpeg process instead of one per speaker. That is the
+    # difference between fitting on a 1 GB host and not.
+    max_speaker_tracks: int = 0
 
     # output
     audio_bitrate: str = "64k"
@@ -84,7 +86,7 @@ class Config:
             sample_rate=_int("SAMPLE_RATE", 48000),
             max_disk_mb=_float("MAX_DISK_MB", 1024.0),
             chunk_seconds=_float("CHUNK_SECONDS", 60.0),
-            max_speaker_tracks=_int("MAX_SPEAKER_TRACKS", 6),
+            max_speaker_tracks=_int("MAX_SPEAKER_TRACKS", 0),
             audio_bitrate=(os.getenv("AUDIO_BITRATE") or "64k").strip(),
             ffmpeg=(os.getenv("FFMPEG") or "ffmpeg").strip(),
             max_upload_mb=_float("MAX_UPLOAD_MB", 9.0),
@@ -121,6 +123,11 @@ class Config:
     def silence_frames(self) -> int:
         """Number of consecutive silent frames that end a segment."""
         return max(1, round(self.silence_timeout * 1000 / self.frame_ms))
+
+    @property
+    def speaker_tracks_enabled(self) -> bool:
+        """Whether isolated per-speaker tracks are written at all."""
+        return self.max_speaker_tracks > 0
 
     @property
     def chunk_frames(self) -> int:

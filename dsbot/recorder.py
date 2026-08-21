@@ -104,7 +104,7 @@ class ChannelRecorder:
         self._chunk_frames = 0
         self._tracks: dict[str, _Track] = {}
         self._segment_speakers: set[int] = set()
-        self._tracks_enabled = cfg.max_speaker_tracks > 0
+        self._tracks_enabled = cfg.speaker_tracks_enabled
         self._pending_silence: list[MixedFrame] = []
 
     # -- lifecycle ----------------------------------------------------------
@@ -212,7 +212,7 @@ class ChannelRecorder:
     async def _open_segment(self) -> None:
         self._segment_ms = now_ms()
         self._segment_speakers = set()
-        self._tracks_enabled = self.cfg.max_speaker_tracks > 0
+        self._tracks_enabled = self.cfg.speaker_tracks_enabled
         self.stats.segments += 1
         log.debug("segment opened for channel %s", self.channel_id)
         await self._open_chunk()
