@@ -1,0 +1,7 @@
+discord.py[voice]==2.7.1
+discord-ext-voice-recv==0.5.4a133
+python-dotenv==1.1.1
+# audioop was removed from the stdlib in 3.13; this backport restores the C
+# implementation used by the mixer. Without it dsbot falls back to a slower
+# pure-Python mixer, which still works.
+audioop-lts==0.2.2; python_version >= "3.13"
