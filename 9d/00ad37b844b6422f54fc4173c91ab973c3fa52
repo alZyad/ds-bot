@@ -1,0 +1,42 @@
+dsbot/settings.py
+  s_6b05788255061c::t_5a8b091c218d8c 32
+  s_6b05788255061c::t_38f31a526204cf 48
+  s_6b05788255061c::t_75f0fd09157304 91-112
+dsbot/bot.py
+  s_6b05788255061c::t_623fc081613110 124-126
+  s_6b05788255061c::t_28a6727130c4d8 749-833
+  s_6b05788255061c::t_fe9fe675630420 193-197
+  s_6b05788255061c::t_aa8fe260a6533c 695-704
+dsbot/config.py
+  s_6b05788255061c::t_e58fed63d726f0 69
+  s_6b05788255061c::t_88922be6926a11 96
+tests/test_bot.py
+  s_6b05788255061c::t_cc9056bc911b62 217-219
+  s_6b05788255061c::t_febb0c21405a2b 61-63
+  s_6b05788255061c::t_e5acc7085483cc 295-350
+  s_6b05788255061c::t_ee5ced6bc533bd 240-242
+README.md
+  s_6b05788255061c::t_036ec3c39fbae9 77-78
+  s_6b05788255061c::t_00adfa2eef50bc 35
+tests/test_config.py
+  s_6b05788255061c::t_5f97d1b71186aa 60-66
+tests/test_settings.py
+  s_6b05788255061c::t_ae0cb13cacf1de 18-26,28-31
+  s_6b05788255061c::t_c3e283d8b2c6b0 27
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.23",
+  "base_commit_sha": "9d00ad37b844b6422f54fc4173c91ab973c3fa52",
+  "prompts": {},
+  "sessions": {
+    "s_6b05788255061c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ec45dcb7-cb17-49fb-80b1-4059cb0c2176",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "alZyad <zyad.alalgui@theodo.com>"
+    }
+  }
+}
