@@ -121,6 +121,9 @@ class RecordingBot(commands.Bot):
             for channel in self.voice_channels(guild)
         }
 
+    def autojoin_enabled(self, guild_id: int) -> bool:
+        return self.settings.autojoin(guild_id, self.cfg.autojoin_default)
+
     # -- reconciliation -----------------------------------------------------
 
     async def on_voice_state_update(self, member, before, after) -> None:
@@ -187,6 +190,11 @@ class RecordingBot(commands.Bot):
         would cut the conversation we are already capturing.
         """
         async with self._lock(guild.id):
+            if not self.autojoin_enabled(guild.id):
+                if self.recorders.get(guild.id) is not None or guild.voice_client is not None:
+                    await self._teardown(guild.id, reason="auto-join disabled")
+                return
+
             eligible = self.eligible_channels(guild)
             recorder = self.recorders.get(guild.id)
             voice = guild.voice_client
@@ -684,10 +692,16 @@ async def rec_status(interaction: discord.Interaction) -> None:
     lines = [header]
 
     if recorder is None:
-        lines.append(
-            f"\n**Live:** idle — waiting for a channel with "
-            f"{bot.cfg.min_speakers}+ people."
-        )
+        if bot.autojoin_enabled(interaction.guild_id):
+            lines.append(
+                f"\n**Live:** idle — waiting for a channel with "
+                f"{bot.cfg.min_speakers}+ people."
+            )
+        else:
+            lines.append(
+                "\n**Live:** off — auto-join is disabled. Turn it on with "
+                "`/rec autojoin enabled:true`."
+            )
     else:
         channel = interaction.guild.get_channel(recorder.channel_id)
         info = recorder.describe()
@@ -729,6 +743,91 @@ async def rec_status(interaction: discord.Interaction) -> None:
             mark = "✅" if people >= bot.cfg.min_speakers else "—"
             lines.append(f"· {mark} {channel.mention if channel else cid}: {people}")
 
+    await interaction.followup.send("\n".join(lines), ephemeral=True)
+
+
+@rec_group.command(
+    name="autojoin", description="Turn automatic recording of busy channels on or off"
+)
+@app_commands.describe(
+    enabled="On: I join busy channels and record. Off: I never join on my own.",
+)
+@app_commands.checks.has_permissions(manage_guild=True)
+async def rec_autojoin(
+    interaction: discord.Interaction,
+    enabled: Optional[bool] = None,
+) -> None:
+    bot: RecordingBot = interaction.client  # type: ignore[assignment]
+    await interaction.response.defer(thinking=True, ephemeral=True)
+
+    if enabled is None:
+        on = bot.autojoin_enabled(interaction.guild_id)
+        detail = (
+            f" I join any channel with {bot.cfg.min_speakers}+ people and record it."
+            if on
+            else " I stay out of every channel until you turn it on."
+        )
+        await interaction.followup.send(
+            f"Auto-join is **{'on' if on else 'off'}** for this server.{detail}",
+            ephemeral=True,
+        )
+        return
+
+    bot.settings.set_autojoin(interaction.guild_id, bool(enabled))
+    await bot.reconcile(interaction.guild)
+
+    if enabled:
+        await interaction.followup.send(
+            f"✅ Auto-join **on**. I will record any channel with "
+            f"{bot.cfg.min_speakers}+ people. Pull audio with `/rec get`, "
+            "see what is buffered with `/rec status`.",
+            ephemeral=True,
+        )
+    else:
+        await interaction.followup.send(
+            "🛑 Auto-join **off**. I left any channel I was in and will not join "
+            "again until you run `/rec autojoin enabled:true`. Buffered audio is "
+            "kept — `/rec purge` deletes it.",
+            ephemeral=True,
+        )
+
+
+@rec_autojoin.error
+async def _autojoin_error(interaction: discord.Interaction, error: Exception) -> None:
+    if isinstance(error, app_commands.MissingPermissions):
+        message = "You need the **Manage Server** permission to change auto-join."
+    else:  # pragma: no cover
+        log.exception("command error", exc_info=error)
+        message = f"Something went wrong: `{error}`"
+    if interaction.response.is_done():
+        await interaction.followup.send(message, ephemeral=True)
+    else:
+        await interaction.response.send_message(message, ephemeral=True)
+
+
+@rec_group.command(name="help", description="What the recorder does and every command")
+async def rec_help(interaction: discord.Interaction) -> None:
+    bot: RecordingBot = interaction.client  # type: ignore[assignment]
+    await interaction.response.defer(thinking=True, ephemeral=True)
+
+    on = bot.autojoin_enabled(interaction.guild_id)
+    lines = [
+        "**ds-bot — voice recording buffer**",
+        (
+            f"Auto-join is **{'on' if on else 'off'}**. When on, I join any voice "
+            f"channel with **{bot.cfg.min_speakers}+** people, record it to a rolling "
+            f"buffer (up to {human_size(bot.cfg.max_disk_bytes)}), and stop after a "
+            "spell of silence. When off, I never join on my own."
+        ),
+        (
+            f"Turn it {'off' if on else 'on'} with "
+            f"`/rec autojoin enabled:{'false' if on else 'true'}` (needs Manage Server)."
+        ),
+        "",
+        "**Commands**",
+    ]
+    for command in sorted(rec_group.walk_commands(), key=lambda c: c.name):
+        lines.append(f"· `/rec {command.name}` — {command.description}")
     await interaction.followup.send("\n".join(lines), ephemeral=True)
 
 

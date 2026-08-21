@@ -57,6 +57,13 @@ def test_from_env(monkeypatch, tmp_path):
     assert cfg.exclude_channel_ids == frozenset({12, 34})
 
 
+def test_autojoin_default_from_env(monkeypatch):
+    monkeypatch.delenv("AUTOJOIN_DEFAULT", raising=False)
+    assert Config.from_env().autojoin_default is False
+    monkeypatch.setenv("AUTOJOIN_DEFAULT", "true")
+    assert Config.from_env().autojoin_default is True
+
+
 def test_from_env_validates(monkeypatch):
     monkeypatch.setenv("MAX_DISK_MB", "0")
     with pytest.raises(ValueError):

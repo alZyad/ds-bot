@@ -29,7 +29,7 @@ class Settings:
 
     def __init__(self, path: Path) -> None:
         self.path = Path(path)
-        self._data: dict[str, Any] = {"channels": {}, "names": {}}
+        self._data: dict[str, Any] = {"channels": {}, "names": {}, "guilds": {}}
         self.load()
 
     # -- persistence --------------------------------------------------------
@@ -45,6 +45,7 @@ class Settings:
         if isinstance(raw, dict):
             self._data["channels"] = dict(raw.get("channels") or {})
             self._data["names"] = dict(raw.get("names") or {})
+            self._data["guilds"] = dict(raw.get("guilds") or {})
 
     def save(self) -> None:
         """Write atomically: a crash mid-save must not truncate the file."""
@@ -86,6 +87,28 @@ class Settings:
 
     def set_silence_rms(self, channel_id: int, value: int | None) -> None:
         self.set_channel_option(channel_id, "silence_rms", value)
+
+    # -- per-guild overrides -----------------------------------------------
+
+    def guild_option(self, guild_id: int, key: str, default: Any = None) -> Any:
+        return (self._data["guilds"].get(str(guild_id)) or {}).get(key, default)
+
+    def set_guild_option(self, guild_id: int, key: str, value: Any) -> None:
+        bucket = self._data["guilds"].setdefault(str(guild_id), {})
+        if value is None:
+            bucket.pop(key, None)
+            if not bucket:
+                self._data["guilds"].pop(str(guild_id), None)
+        else:
+            bucket[key] = value
+        self.save()
+
+    def autojoin(self, guild_id: int, default: bool) -> bool:
+        value = self.guild_option(guild_id, "autojoin")
+        return default if value is None else bool(value)
+
+    def set_autojoin(self, guild_id: int, value: bool | None) -> None:
+        self.set_guild_option(guild_id, "autojoin", value)
 
     # -- speaker names ------------------------------------------------------
 

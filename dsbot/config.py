@@ -66,6 +66,7 @@ class Config:
 
     # behaviour
     announce: bool = True
+    autojoin_default: bool = False
     include_channel_ids: frozenset[int] = field(default_factory=frozenset)
     exclude_channel_ids: frozenset[int] = field(default_factory=frozenset)
     log_level: str = "INFO"
@@ -92,6 +93,7 @@ class Config:
             max_upload_mb=_float("MAX_UPLOAD_MB", 9.0),
             merge_gap_seconds=_float("MERGE_GAP_SECONDS", 120.0),
             announce=_bool("ANNOUNCE", True),
+            autojoin_default=_bool("AUTOJOIN_DEFAULT", False),
             include_channel_ids=_ids("INCLUDE_CHANNEL_IDS"),
             exclude_channel_ids=_ids("EXCLUDE_CHANNEL_IDS"),
             log_level=(os.getenv("LOG_LEVEL") or "INFO").strip().upper(),

@@ -32,7 +32,7 @@ The full rationale, including the alternatives that were rejected, is in
 | Requirement | How it works |
 | --- | --- |
 | Detect how many people are in each audio channel | `on_voice_state_update` plus a 20 s reconciliation sweep count non-bot members of every voice/stage channel. |
-| Record when 2+ people are present | The bot joins the first channel to become eligible and stays there. Threshold is `MIN_SPEAKERS`. |
+| Record when 2+ people are present | The bot joins the first channel to become eligible and stays there. Threshold is `MIN_SPEAKERS`. Auto-join is **off by default** — an admin turns it on per server with `/rec autojoin enabled:true` (or flip the server-wide default with `AUTOJOIN_DEFAULT`). |
 | Stop on 5 s of silence, resume as soon as someone talks | The silence that follows speech is *buffered*, not written. If someone speaks again within `SILENCE_TIMEOUT` the pause is replayed into the recording (natural rhythm kept); otherwise it is dropped and the segment is closed. The next word opens a new segment on the very next 20 ms frame — there is no restart latency, because the bot never actually leaves the channel. |
 | Keep a bounded buffer, dropping old bits | Audio is written as 60 s chunks. Whenever the total exceeds `MAX_DISK_MB` the oldest chunk is deleted. One rule, no strategies to choose between. |
 | A command to get the recordings in chat | `/rec get` posts the mixed recording, one file per conversation. `/rec get-all` adds every speaker's isolated track; `/rec get-single` gives you a dropdown to pick one person. |
@@ -74,6 +74,8 @@ Slash commands are synced on startup and may take a minute to appear.
 
 | Command | What it does |
 | --- | --- |
+| `/rec help` | What the recorder does and every command, with the current auto-join state. Ephemeral. |
+| `/rec autojoin [enabled]` | Turn automatic recording of busy channels on or off (off by default). Omit `enabled` to read the current state. Requires **Manage Server**. |
 | `/rec get [channel] [minutes]` | The mixed recording, one `.m4a` per conversation. Defaults to the channel you are in and the whole buffer. |
 | `/rec get-all [channel] [minutes]` | The mix plus every speaker's isolated track. Asks for confirmation past 10 files. |
 | `/rec get-single [channel] [minutes]` | A dropdown of who has audio buffered; pick one and get only their voice. |

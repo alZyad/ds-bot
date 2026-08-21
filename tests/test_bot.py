@@ -58,7 +58,9 @@ class FakeGuild:
 
 @pytest.fixture
 def bot(tmp_path):
-    return RecordingBot(Config(data_dir=tmp_path, min_speakers=2, leave_grace=0.0))
+    return RecordingBot(
+        Config(data_dir=tmp_path, min_speakers=2, leave_grace=0.0, autojoin_default=True)
+    )
 
 
 def guild_with(*channels):
@@ -212,7 +214,9 @@ async def test_reconcile_moves_when_the_channel_empties(bot, monkeypatch):
 
 async def test_a_blip_does_not_sever_the_recording(tmp_path, monkeypatch):
     """Someone reseating a headset drops the count to one for a moment."""
-    bot = RecordingBot(Config(data_dir=tmp_path, min_speakers=2, leave_grace=30.0))
+    bot = RecordingBot(
+        Config(data_dir=tmp_path, min_speakers=2, leave_grace=30.0, autojoin_default=True)
+    )
     calls = []
     monkeypatch.setattr(bot, "_setup", lambda channel: _record(calls, "setup"))
     monkeypatch.setattr(bot, "_teardown", lambda guild_id, reason: _record(calls, reason))
@@ -233,7 +237,9 @@ async def test_a_blip_does_not_sever_the_recording(tmp_path, monkeypatch):
 
 
 async def test_the_grace_period_does_expire(tmp_path, monkeypatch):
-    bot = RecordingBot(Config(data_dir=tmp_path, min_speakers=2, leave_grace=0.05))
+    bot = RecordingBot(
+        Config(data_dir=tmp_path, min_speakers=2, leave_grace=0.05, autojoin_default=True)
+    )
     calls = []
 
     async def teardown(guild_id, reason):
@@ -284,6 +290,62 @@ async def test_reconcile_recovers_from_a_lost_connection(bot, monkeypatch):
 
     await bot.reconcile(guild)
     assert calls == [("teardown", "connection lost"), ("setup", 1)]
+
+
+# -- auto-join toggle -------------------------------------------------------
+
+async def test_autojoin_is_off_by_default(tmp_path, monkeypatch):
+    bot = RecordingBot(Config(data_dir=tmp_path, min_speakers=2))
+    calls = []
+    monkeypatch.setattr(bot, "_setup", lambda channel: _record(calls, channel))
+    channel = FakeChannel(1, members=[FakeMember(1), FakeMember(2)])
+    guild = guild_with(channel)
+
+    await bot.reconcile(guild)
+    assert calls == []
+
+
+async def test_autojoin_can_be_turned_on(tmp_path, monkeypatch):
+    bot = RecordingBot(Config(data_dir=tmp_path, min_speakers=2))
+    started = []
+    monkeypatch.setattr(bot, "_setup", lambda channel: _record(started, channel))
+    channel = FakeChannel(1, members=[FakeMember(1), FakeMember(2)])
+    guild = guild_with(channel)
+
+    bot.settings.set_autojoin(guild.id, True)
+    await bot.reconcile(guild)
+    assert started == [channel]
+
+
+async def test_turning_autojoin_off_tears_down_the_recording(tmp_path, monkeypatch):
+    bot = RecordingBot(
+        Config(data_dir=tmp_path, min_speakers=2, autojoin_default=True)
+    )
+    reasons = []
+
+    async def teardown(guild_id, reason):
+        reasons.append(reason)
+        bot.recorders.pop(guild_id, None)
+
+    monkeypatch.setattr(bot, "_teardown", teardown)
+    channel = FakeChannel(1, members=[FakeMember(1), FakeMember(2)])
+    guild = guild_with(channel)
+    connected(guild, 1, bot)
+
+    bot.settings.set_autojoin(guild.id, False)
+    await bot.reconcile(guild)
+    assert reasons == ["auto-join disabled"]
+
+
+def test_autojoin_default_is_a_per_guild_override(tmp_path):
+    on = RecordingBot(Config(data_dir=tmp_path, autojoin_default=True))
+    off = RecordingBot(Config(data_dir=tmp_path))
+    assert on.autojoin_enabled(100) is True
+    assert off.autojoin_enabled(100) is False
+
+    off.settings.set_autojoin(100, True)
+    assert off.autojoin_enabled(100) is True
+    assert off.autojoin_enabled(200) is False
 
 
 # -- names ------------------------------------------------------------------

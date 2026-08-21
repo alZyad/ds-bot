@@ -15,6 +15,20 @@ def test_channel_overrides_persist(tmp_path):
     assert Settings(path).channel_option(7, "silence_rms") is None
 
 
+def test_autojoin_persists(tmp_path):
+    path = tmp_path / "settings.json"
+    first = Settings(path)
+    assert first.autojoin(100, default=False) is False
+    assert first.autojoin(100, default=True) is True
+
+    first.set_autojoin(100, True)
+    assert Settings(path).autojoin(100, default=False) is True
+
+    first.set_autojoin(100, None)
+    assert Settings(path).autojoin(100, default=False) is False
+    assert Settings(path).guild_option(100, "autojoin") is None
+
+
 def test_names_survive_a_restart(tmp_path):
     path = tmp_path / "settings.json"
     settings = Settings(path)
