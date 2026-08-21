@@ -1,15 +1,21 @@
-"""On-disk ring buffer of mp3 chunks, one directory per voice channel.
+"""On-disk ring buffer of AAC chunks, one directory per voice channel.
 
 Everything needed to reason about a recording lives in the file *name*, so the
 store survives restarts and crashes with no index to rebuild or corrupt:
 
-    data/<guild_id>/<channel_id>/c<chunk_start_ms>_d<duration_ms>_s<segment_start_ms>.mp3
+    data/recordings/<guild_id>/<channel_id>/c<start>_d<duration>_s<segment>_t<track>.aac
 
-* ``chunk_start_ms``   wall-clock start of the chunk (unix epoch, ms)
-* ``duration_ms``      how much audio the chunk actually contains
-* ``segment_start_ms`` identifies the continuous conversation the chunk belongs
-  to.  Chunks sharing a segment are gapless; a new segment means there was more
-  than ``SILENCE_TIMEOUT`` of silence in between.
+* ``start``     wall-clock start of the chunk (unix epoch, ms)
+* ``duration``  how much audio the chunk actually contains, in ms
+* ``segment``   identifies the continuous conversation the chunk belongs to.
+  Chunks sharing a segment are gapless; a new segment means there was more than
+  ``SILENCE_TIMEOUT`` of silence in between.
+* ``track``     ``mix`` for the mixed recording, or a Discord user id for one
+  speaker's isolated track.
+
+Chunks sharing a ``start`` form a *group*: the mixed chunk and the per-speaker
+chunks covering the same moment.  Retention deletes whole groups, so a speaker
+track can never outlive the mix it belongs to.
 
 Files still being written carry a ``.part`` suffix and are ignored by readers,
 so a chunk becomes visible atomically when it is renamed into place.
@@ -26,7 +32,12 @@ from pathlib import Path
 
 log = logging.getLogger(__name__)
 
-CHUNK_RE = re.compile(r"^c(?P<start>\d+)_d(?P<dur>\d+)_s(?P<seg>\d+)\.mp3$")
+MIX_TRACK = "mix"
+CHUNK_SUFFIX = ".aac"
+CHUNK_RE = re.compile(
+    r"^c(?P<start>\d+)_d(?P<dur>\d+)_s(?P<seg>\d+)_t(?P<track>mix|\d+)\.aac$"
+)
+CHUNK_GLOB = f"c*{CHUNK_SUFFIX}"
 
 
 def now_ms() -> int:
@@ -40,11 +51,20 @@ class Chunk:
     start_ms: int
     segment_ms: int
     duration_ms: int
+    track: str
     path: Path
 
     @property
     def end_ms(self) -> int:
         return self.start_ms + self.duration_ms
+
+    @property
+    def is_mix(self) -> bool:
+        return self.track == MIX_TRACK
+
+    @property
+    def user_id(self) -> int | None:
+        return None if self.is_mix else int(self.track)
 
     @property
     def size_bytes(self) -> int:
@@ -62,17 +82,18 @@ class Chunk:
             start_ms=int(m["start"]),
             segment_ms=int(m["seg"]),
             duration_ms=int(m["dur"]),
+            track=m["track"],
             path=path,
         )
 
     @staticmethod
-    def filename(start_ms: int, duration_ms: int, segment_ms: int) -> str:
-        return f"c{start_ms}_d{duration_ms}_s{segment_ms}.mp3"
+    def filename(start_ms: int, duration_ms: int, segment_ms: int, track: str) -> str:
+        return f"c{start_ms}_d{duration_ms}_s{segment_ms}_t{track}{CHUNK_SUFFIX}"
 
 
 @dataclass(frozen=True)
 class Segment:
-    """A contiguous conversation, i.e. a group of chunks."""
+    """A contiguous conversation, i.e. a group of chunks of one track."""
 
     segment_ms: int
     chunks: tuple[Chunk, ...]
@@ -89,6 +110,10 @@ class Segment:
     def end_ms(self) -> int:
         return self.chunks[-1].end_ms
 
+    @property
+    def size_bytes(self) -> int:
+        return sum(c.size_bytes for c in self.chunks)
+
 
 def group_segments(chunks: Sequence[Chunk]) -> list[Segment]:
     ordered: dict[int, list[Chunk]] = {}
@@ -97,23 +122,30 @@ def group_segments(chunks: Sequence[Chunk]) -> list[Segment]:
     return [Segment(seg, tuple(items)) for seg, items in sorted(ordered.items())]
 
 
+def merge_segments(segments: Sequence[Segment], gap_ms: int) -> list[Segment]:
+    """Glue segments separated by no more than ``gap_ms`` into one.
+
+    Export emits one file per segment, and a 5 s pause is enough to start a new
+    one, so a chatty evening would otherwise arrive as dozens of attachments.
+    The gap being merged over is silence that was never stored, so nothing is
+    added to the audio — only the file boundary moves.
+    """
+    merged: list[Segment] = []
+    for segment in sorted(segments, key=lambda s: s.start_ms):
+        if merged and segment.start_ms - merged[-1].end_ms <= gap_ms:
+            previous = merged[-1]
+            merged[-1] = Segment(previous.segment_ms, previous.chunks + segment.chunks)
+        else:
+            merged.append(segment)
+    return merged
+
+
 class ChunkStore:
     """Reads, lists and trims the chunk directories."""
 
-    def __init__(
-        self,
-        root: Path,
-        *,
-        retention_ms: int,
-        strategy: str = "oldest-chunk",
-        high_water_ms: int = 0,
-        low_water_ms: int = 0,
-    ) -> None:
+    def __init__(self, root: Path, *, max_bytes: int) -> None:
         self.root = Path(root)
-        self.retention_ms = retention_ms
-        self.strategy = strategy
-        self.high_water_ms = high_water_ms
-        self.low_water_ms = low_water_ms
+        self.max_bytes = max_bytes
 
     # -- layout -------------------------------------------------------------
 
@@ -144,16 +176,20 @@ class ChunkStore:
         guild_id: int,
         channel_id: int,
         *,
+        track: str | None = MIX_TRACK,
         since_ms: int | None = None,
         until_ms: int | None = None,
     ) -> list[Chunk]:
+        """Chunks of one channel. ``track=None`` returns every track."""
         directory = self.channel_dir(guild_id, channel_id)
         if not directory.is_dir():
             return []
         chunks: list[Chunk] = []
-        for path in directory.glob("c*.mp3"):
+        for path in directory.glob(CHUNK_GLOB):
             chunk = Chunk.parse(path)
             if chunk is None:
+                continue
+            if track is not None and chunk.track != track:
                 continue
             if since_ms is not None and chunk.end_ms <= since_ms:
                 continue
@@ -162,16 +198,42 @@ class ChunkStore:
             chunks.append(chunk)
         return sorted(chunks)
 
+    def all_chunks(self) -> list[Chunk]:
+        """Every chunk of every track in every channel, oldest first."""
+        chunks: list[Chunk] = []
+        for guild_id, channel_id in self.known_channels():
+            chunks.extend(self.list_chunks(guild_id, channel_id, track=None))
+        return sorted(chunks)
+
+    def speakers(self, guild_id: int, channel_id: int) -> list[int]:
+        """User ids that have an isolated track buffered for this channel."""
+        seen = {
+            chunk.user_id
+            for chunk in self.list_chunks(guild_id, channel_id, track=None)
+            if not chunk.is_mix
+        }
+        return sorted(uid for uid in seen if uid is not None)
+
     def total_duration_ms(self, guild_id: int, channel_id: int) -> int:
         return sum(c.duration_ms for c in self.list_chunks(guild_id, channel_id))
+
+    def total_bytes(self, guild_id: int | None = None, channel_id: int | None = None) -> int:
+        if guild_id is None or channel_id is None:
+            return sum(c.size_bytes for c in self.all_chunks())
+        return sum(
+            c.size_bytes for c in self.list_chunks(guild_id, channel_id, track=None)
+        )
 
     def segments(self, guild_id: int, channel_id: int, **kw) -> list[Segment]:
         return group_segments(self.list_chunks(guild_id, channel_id, **kw))
 
     # -- writing ------------------------------------------------------------
 
-    def part_path(self, guild_id: int, channel_id: int, chunk_start_ms: int) -> Path:
-        return self.ensure_dir(guild_id, channel_id) / f"c{chunk_start_ms}.part"
+    def part_path(
+        self, guild_id: int, channel_id: int, chunk_start_ms: int, track: str
+    ) -> Path:
+        directory = self.ensure_dir(guild_id, channel_id)
+        return directory / f"c{chunk_start_ms}_t{track}.part"
 
     def commit(
         self,
@@ -180,37 +242,31 @@ class ChunkStore:
         start_ms: int,
         duration_ms: int,
         segment_ms: int,
+        track: str,
     ) -> Chunk | None:
         """Rename a finished ``.part`` file to its final, self-describing name."""
         if not part.exists() or part.stat().st_size == 0 or duration_ms <= 0:
             part.unlink(missing_ok=True)
             return None
-        final = part.with_name(Chunk.filename(start_ms, duration_ms, segment_ms))
+        final = part.with_name(Chunk.filename(start_ms, duration_ms, segment_ms, track))
         part.replace(final)
-        return Chunk(start_ms, segment_ms, duration_ms, final)
+        return Chunk(start_ms, segment_ms, duration_ms, track, final)
 
     # -- retention ----------------------------------------------------------
 
-    def trim(self, guild_id: int, channel_id: int) -> list[Chunk]:
-        """Apply the configured retention strategy. Returns deleted chunks."""
-        chunks = self.list_chunks(guild_id, channel_id)
-        victims = plan_trim(
-            chunks,
-            retention_ms=self.retention_ms,
-            strategy=self.strategy,
-            high_water_ms=self.high_water_ms,
-            low_water_ms=self.low_water_ms,
-        )
+    def trim(self) -> list[Chunk]:
+        """Enforce the disk budget across the whole store. Returns what went."""
+        victims = plan_trim(self.all_chunks(), max_bytes=self.max_bytes)
         for chunk in victims:
             try:
                 chunk.path.unlink(missing_ok=True)
             except OSError:  # pragma: no cover - unlikely, keep the loop alive
                 log.warning("could not delete %s", chunk.path, exc_info=True)
         if victims:
-            dropped = sum(c.duration_ms for c in victims) / 1000
+            freed = sum(c.size_bytes for c in victims)
             log.info(
-                "trimmed %d chunk(s) (%.0fs) from %s/%s using %s",
-                len(victims), dropped, guild_id, channel_id, self.strategy,
+                "trimmed %d file(s) (%.1f MiB) to stay under %.0f MiB",
+                len(victims), freed / 1048576, self.max_bytes / 1048576,
             )
         return victims
 
@@ -219,7 +275,7 @@ class ChunkStore:
         removed = 0
         if not directory.is_dir():
             return 0
-        for path in list(directory.glob("c*.mp3")) + list(directory.glob("*.part")):
+        for path in list(directory.glob(CHUNK_GLOB)) + list(directory.glob("*.part")):
             try:
                 path.unlink()
                 removed += 1
@@ -242,66 +298,28 @@ class ChunkStore:
         return removed
 
 
-def plan_trim(
-    chunks: Iterable[Chunk],
-    *,
-    retention_ms: int,
-    strategy: str = "oldest-chunk",
-    high_water_ms: int = 0,
-    low_water_ms: int = 0,
-) -> list[Chunk]:
+def plan_trim(chunks: Iterable[Chunk], *, max_bytes: int) -> list[Chunk]:
     """Decide which chunks to drop. Pure function, so it is easy to test.
 
-    ``oldest-chunk``    drop the oldest chunk until we are back under the
-                        retention target.  Overshoot is at most one chunk, but
-                        the oldest surviving conversation may start mid-sentence.
-    ``oldest-segment``  drop whole conversations, oldest first.  What is kept is
-                        always a set of complete discussions; the buffer swings
-                        by the size of one segment.
-    ``high-water``      only trim once retention + ``high_water_ms`` is exceeded,
-                        and then go down to retention - ``low_water_ms``.  Fewest
-                        deletions and least IO churn, widest fluctuation.
-    """
-    ordered = sorted(chunks)
-    total = sum(c.duration_ms for c in ordered)
+    One rule: while the store is over budget, drop the oldest *group* — the
+    mixed chunk for a moment plus every speaker track covering it.  Deleting a
+    group costs a handful of ``unlink`` calls and one minute of the oldest
+    audio, and it can never leave a speaker track orphaned from its mix.
 
-    if strategy == "high-water":
-        if total <= retention_ms + high_water_ms:
-            return []
-        target = max(0, retention_ms - low_water_ms)
-    elif strategy in ("oldest-chunk", "oldest-segment"):
-        if total <= retention_ms:
-            return []
-        target = retention_ms
-    else:
-        raise ValueError(f"unknown retention strategy {strategy!r}")
+    The last remaining group is always kept, so a budget smaller than a single
+    chunk degrades to "hold one chunk" rather than to an empty buffer.
+    """
+    groups: dict[tuple[Path, int], list[Chunk]] = {}
+    for chunk in chunks:
+        groups.setdefault((chunk.path.parent, chunk.start_ms), []).append(chunk)
+
+    ordered = sorted(groups.items(), key=lambda item: (item[0][1], str(item[0][0])))
+    total = sum(c.size_bytes for group in groups.values() for c in group)
 
     victims: list[Chunk] = []
-
-    if strategy == "oldest-segment":
-        segments = group_segments(ordered)
-        index = 0
-        # Drop whole conversations, oldest first, while more than one remains.
-        while total > target and len(segments) - index > 1:
-            segment = segments[index]
-            victims.extend(segment.chunks)
-            total -= segment.duration_ms
-            index += 1
-        # A single segment can be longer than the whole target on its own (a
-        # 4h meeting).  Fall back to chunk granularity inside it rather than
-        # dropping the only thing we have.
-        if total > target and index < len(segments):
-            for chunk in segments[index].chunks[:-1]:
-                if total <= target:
-                    break
-                victims.append(chunk)
-                total -= chunk.duration_ms
-        return victims
-
-    keep_at_least_one = len(ordered) - 1
-    for chunk in ordered[:keep_at_least_one]:
-        if total <= target:
+    for _, group in ordered[:-1]:  # never empty the buffer completely
+        if total <= max_bytes:
             break
-        victims.append(chunk)
-        total -= chunk.duration_ms
+        victims.extend(sorted(group))
+        total -= sum(c.size_bytes for c in group)
     return victims

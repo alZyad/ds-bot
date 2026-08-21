@@ -7,6 +7,7 @@ import contextlib
 import logging
 import re
 import shutil
+import time
 import uuid
 from typing import Optional
 
@@ -15,16 +16,19 @@ from discord import app_commands
 from discord.ext import commands, tasks, voice_recv
 
 from .config import Config
-from .encoder import export, ffmpeg_available
+from .encoder import export, ffmpeg_available, split_for_upload
 from .format import discord_time, human_duration, human_size, slug
 from .recorder import ChannelRecorder
-from .store import ChunkStore, now_ms
+from .settings import Settings
+from .store import MIX_TRACK, ChunkStore, Segment, group_segments, merge_segments, now_ms
 
 log = logging.getLogger(__name__)
 
 MAX_ATTACHMENTS_PER_MESSAGE = 10
 UPLOAD_HEADROOM = 256 * 1024  # leave room for multipart overhead
 RECONCILE_SECONDS = 20.0
+CONFIRM_ABOVE_FILES = 10
+SELECT_LIMIT = 25  # Discord's cap on dropdown options
 
 
 class RecordingBot(commands.Bot):
@@ -39,15 +43,15 @@ class RecordingBot(commands.Bot):
 
         self.cfg = cfg
         self.store = ChunkStore(
-            cfg.data_dir / "recordings",
-            retention_ms=cfg.retention_ms,
-            strategy=cfg.retention_strategy,
-            high_water_ms=int(cfg.high_water_slack * 1000),
-            low_water_ms=int(cfg.low_water_slack * 1000),
+            cfg.data_dir / "recordings", max_bytes=cfg.max_disk_bytes
         )
+        self.settings = Settings(cfg.data_dir / "settings.json")
         self.recorders: dict[int, ChannelRecorder] = {}  # guild_id -> recorder
         self._guild_locks: dict[int, asyncio.Lock] = {}
         self._export_locks: dict[int, asyncio.Lock] = {}
+        self._eligible_since: dict[int, float] = {}  # channel_id -> monotonic
+        self._leave_since: dict[int, float] = {}  # guild_id -> monotonic
+        self._leave_tasks: dict[int, asyncio.Task] = {}
 
     # -- setup --------------------------------------------------------------
 
@@ -63,6 +67,8 @@ class RecordingBot(commands.Bot):
 
     async def close(self) -> None:
         self.reconcile_loop.cancel()
+        for task in list(self._leave_tasks.values()):
+            task.cancel()
         for guild_id in list(self.recorders):
             with contextlib.suppress(Exception):
                 await self._teardown(guild_id, reason="shutting down")
@@ -79,22 +85,35 @@ class RecordingBot(commands.Bot):
         me = channel.guild.me
         return [m for m in channel.members if not m.bot and (me is None or m.id != me.id)]
 
+    def voice_channels(self, guild: discord.Guild) -> list:
+        return list(guild.voice_channels) + list(guild.stage_channels)
+
     def eligible_channels(self, guild: discord.Guild) -> list:
-        """Voice channels that currently hold enough humans, busiest first."""
+        """Channels holding enough humans, in the order they became eligible.
+
+        First come, first served: the channel that filled up first is the one we
+        follow.  Ranking by headcount instead would make a second, busier
+        channel steal the connection away from a conversation already underway.
+        """
+        now = time.monotonic()
         candidates = []
-        for channel in list(guild.voice_channels) + list(guild.stage_channels):
-            if not self.cfg.channel_allowed(channel.id):
-                continue
-            people = len(self.humans_in(channel))
-            if people >= self.cfg.min_speakers:
-                candidates.append((people, channel))
-        candidates.sort(key=lambda item: (-item[0], item[1].id))
-        return [channel for _, channel in candidates]
+        for channel in self.voice_channels(guild):
+            enough = (
+                self.cfg.channel_allowed(channel.id)
+                and len(self.humans_in(channel)) >= self.cfg.min_speakers
+            )
+            if enough:
+                self._eligible_since.setdefault(channel.id, now)
+                candidates.append(channel)
+            else:
+                self._eligible_since.pop(channel.id, None)
+        candidates.sort(key=lambda c: (self._eligible_since.get(c.id, now), c.id))
+        return candidates
 
     def occupancy(self, guild: discord.Guild) -> dict[int, int]:
         return {
             channel.id: len(self.humans_in(channel))
-            for channel in list(guild.voice_channels) + list(guild.stage_channels)
+            for channel in self.voice_channels(guild)
         }
 
     # -- reconciliation -----------------------------------------------------
@@ -120,6 +139,41 @@ class RecordingBot(commands.Bot):
     def _lock(self, guild_id: int) -> asyncio.Lock:
         return self._guild_locks.setdefault(guild_id, asyncio.Lock())
 
+    def _grace_remaining(self, guild_id: int) -> float:
+        """Seconds of leave grace left, starting the clock on the first call."""
+        started = self._leave_since.get(guild_id)
+        if started is None:
+            self._leave_since[guild_id] = time.monotonic()
+            return self.cfg.leave_grace
+        return self.cfg.leave_grace - (time.monotonic() - started)
+
+    def _cancel_grace(self, guild_id: int) -> None:
+        self._leave_since.pop(guild_id, None)
+        task = self._leave_tasks.pop(guild_id, None)
+        if task is not None:
+            task.cancel()
+
+    def _schedule_recheck(self, guild: discord.Guild, delay: float) -> None:
+        """Re-run reconciliation once the grace period has elapsed.
+
+        The periodic loop is far slower than the grace, so without this a
+        channel that emptied would keep its connection until the next sweep.
+        """
+        existing = self._leave_tasks.get(guild.id)
+        if existing is not None and not existing.done():
+            return
+
+        async def later() -> None:
+            with contextlib.suppress(asyncio.CancelledError):
+                await asyncio.sleep(max(0.0, delay))
+                self._leave_tasks.pop(guild.id, None)
+                with contextlib.suppress(Exception):
+                    await self.reconcile(guild)
+
+        self._leave_tasks[guild.id] = asyncio.create_task(
+            later(), name=f"leave-grace-{guild.id}"
+        )
+
     async def reconcile(self, guild: discord.Guild) -> None:
         """Make the voice connection match who is actually talking where.
 
@@ -136,7 +190,15 @@ class RecordingBot(commands.Bot):
                 current = guild.get_channel(recorder.channel_id)
                 connected = voice is not None and voice.is_connected()
                 if connected and current is not None and current in eligible:
+                    self._cancel_grace(guild.id)
                     return  # already doing the right thing
+                if connected and current is not None:
+                    # Hold on briefly: a reconnect, a channel move or someone
+                    # reseating a headset should not sever the recording.
+                    remaining = self._grace_remaining(guild.id)
+                    if remaining > 0:
+                        self._schedule_recheck(guild, remaining)
+                        return
                 await self._teardown(
                     guild.id,
                     reason="channel no longer eligible" if connected else "connection lost",
@@ -164,9 +226,15 @@ class RecordingBot(commands.Bot):
             return
 
         recorder = ChannelRecorder(
-            self.cfg, self.store, guild_id=guild.id, channel_id=channel.id
+            self.cfg,
+            self.store,
+            guild_id=guild.id,
+            channel_id=channel.id,
+            silence_rms=self.settings.silence_rms(channel.id, self.cfg.silence_rms),
+            on_speaker=lambda uid: self.remember_speaker(guild, uid),
         )
         self.recorders[guild.id] = recorder
+        self._cancel_grace(guild.id)
         await recorder.start()
 
         def on_packet(user, data) -> None:
@@ -184,11 +252,12 @@ class RecordingBot(commands.Bot):
         await self._announce(
             channel,
             f"🔴 Recording **{channel.name}** — {len(self.humans_in(channel))} people "
-            f"connected. Rolling buffer: {human_duration(self.cfg.retention_ms)}. "
-            f"Use `/rec get` to pull the audio.",
+            f"connected. Buffer: up to {human_size(self.cfg.max_disk_bytes)} of audio. "
+            f"Use `/rec get` to pull it.",
         )
 
     async def _teardown(self, guild_id: int, *, reason: str) -> None:
+        self._cancel_grace(guild_id)
         recorder = self.recorders.pop(guild_id, None)
         guild = self.get_guild(guild_id)
         voice = guild.voice_client if guild is not None else None
@@ -220,6 +289,21 @@ class RecordingBot(commands.Bot):
         with contextlib.suppress(discord.HTTPException, discord.Forbidden, AttributeError):
             await target.send(message)
 
+    # -- speaker names ------------------------------------------------------
+
+    def remember_speaker(self, guild: discord.Guild, user_id: int) -> None:
+        """Snapshot a display name so it survives the member leaving."""
+        member = guild.get_member(user_id)
+        if member is None:
+            return
+        self.settings.remember_name(user_id, _member_label(member))
+
+    def speaker_label(self, guild: discord.Guild, user_id: int) -> str:
+        member = guild.get_member(user_id) if guild is not None else None
+        if member is not None:
+            return _member_label(member)
+        return self.settings.name_for(user_id) or f"user {user_id}"
+
     # -- export -------------------------------------------------------------
 
     def upload_limit(self, guild: discord.Guild) -> int:
@@ -229,6 +313,20 @@ class RecordingBot(commands.Bot):
 
     def export_lock(self, channel_id: int) -> asyncio.Lock:
         return self._export_locks.setdefault(channel_id, asyncio.Lock())
+
+    def segments_for(
+        self, guild_id: int, channel_id: int, *, track: str, since_ms: int | None
+    ) -> list[Segment]:
+        """The conversations of one track, merged into what will become files."""
+        chunks = self.store.list_chunks(
+            guild_id, channel_id, track=track, since_ms=since_ms
+        )
+        return merge_segments(group_segments(chunks), self.cfg.merge_gap_ms)
+
+
+def _member_label(member) -> str:
+    display = getattr(member, "display_name", None) or member.name
+    return f"{display} (@{member.name})" if display != member.name else f"@{member.name}"
 
 
 # ---------------------------------------------------------------------------
@@ -243,7 +341,7 @@ rec_group = app_commands.Group(
 
 
 def _safe_name(name: str) -> str:
-    """A filename-safe version of a channel name, for the exported attachments."""
+    """A filename-safe version of a name, for the exported attachments."""
     cleaned = re.sub(r"-{2,}", "-", "".join(
         c if c.isalnum() or c in "-_" else "-" for c in name
     )).strip("-_")
@@ -275,7 +373,156 @@ def _resolve_channel(bot: RecordingBot, interaction, explicit):
     return best
 
 
-@rec_group.command(name="get", description="Send the buffered recording of a voice channel as mp3")
+def _since(bot: RecordingBot, minutes: float | None) -> int | None:
+    return None if minutes is None else now_ms() - int(minutes * 60_000)
+
+
+def _count_files(bot: RecordingBot, jobs, max_bytes: int) -> int:
+    return sum(
+        len(split_for_upload(segment.chunks, max_bytes))
+        for _, segments in jobs
+        for segment in segments
+    )
+
+
+async def _flush_live(bot: RecordingBot, guild_id: int, channel_id: int) -> None:
+    recorder = bot.recorders.get(guild_id)
+    if recorder is not None and recorder.channel_id == channel_id:
+        await recorder.flush()  # make the in-progress chunk visible
+
+
+async def _deliver(interaction, bot: RecordingBot, target, jobs, header: str) -> None:
+    """Encode every (label, segments) job and upload the results."""
+    workdir = bot.cfg.data_dir / "exports" / uuid.uuid4().hex
+    base = _safe_name(target.name)
+    try:
+        parts = []
+        for label, segments in jobs:
+            prefix = f"{base}-{slug(segments[0].start_ms)}"
+            if label:
+                prefix = f"{prefix}-{_safe_name(label)}"
+            parts.extend(
+                await export(
+                    segments,
+                    workdir,
+                    prefix=prefix,
+                    max_bytes=bot.upload_limit(interaction.guild),
+                    binary=bot.cfg.ffmpeg,
+                    bitrate=bot.cfg.audio_bitrate,
+                )
+            )
+    except Exception as exc:
+        log.exception("export failed for channel %s", target.id)
+        shutil.rmtree(workdir, ignore_errors=True)
+        await interaction.followup.send(f"Export failed: `{exc}`")
+        return
+
+    try:
+        if not parts:
+            await interaction.followup.send("Nothing to send.")
+            return
+        first = True
+        for offset in range(0, len(parts), MAX_ATTACHMENTS_PER_MESSAGE):
+            batch = parts[offset : offset + MAX_ATTACHMENTS_PER_MESSAGE]
+            files = [discord.File(p.path, filename=p.path.name) for p in batch]
+            caption = " · ".join(_caption(p) for p in batch)
+            if first:
+                await interaction.followup.send(f"{header}\n{caption}", files=files)
+                first = False
+            elif interaction.channel is not None:
+                await interaction.channel.send(content=caption, files=files)
+            else:  # pragma: no cover - the command is guild-only
+                await interaction.followup.send(caption, files=files)
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+class _Confirm(discord.ui.View):
+    """Guard against dumping dozens of attachments without being asked."""
+
+    def __init__(self, requester_id: int) -> None:
+        super().__init__(timeout=60)
+        self.requester_id = requester_id
+        self.confirmed = False
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.requester_id:
+            await interaction.response.send_message(
+                "Only whoever ran the command can confirm it.", ephemeral=True
+            )
+            return False
+        return True
+
+    @discord.ui.button(label="Send them all", style=discord.ButtonStyle.primary)
+    async def send(self, interaction: discord.Interaction, _button) -> None:
+        self.confirmed = True
+        await interaction.response.defer()
+        self.stop()
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, _button) -> None:
+        await interaction.response.edit_message(content="Cancelled.", view=None)
+        self.stop()
+
+
+class _SpeakerSelect(discord.ui.Select):
+    def __init__(self, bot: RecordingBot, guild, target, speakers, minutes) -> None:
+        options = []
+        for user_id in speakers[:SELECT_LIMIT]:
+            segments = bot.segments_for(
+                guild.id, target.id, track=str(user_id), since_ms=_since(bot, minutes)
+            )
+            total = sum(s.duration_ms for s in segments)
+            options.append(
+                discord.SelectOption(
+                    label=bot.speaker_label(guild, user_id)[:100],
+                    value=str(user_id),
+                    description=f"{human_duration(total)} of speech",
+                )
+            )
+        super().__init__(placeholder="Whose voice do you want?", options=options)
+        self.bot = bot
+        self.target = target
+        self.minutes = minutes
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        user_id = int(self.values[0])
+        bot, target = self.bot, self.target
+        await interaction.response.defer(thinking=True)
+        label = bot.speaker_label(interaction.guild, user_id)
+        async with bot.export_lock(target.id):
+            await _flush_live(bot, interaction.guild_id, target.id)
+            segments = bot.segments_for(
+                interaction.guild_id, target.id, track=str(user_id),
+                since_ms=_since(bot, self.minutes),
+            )
+            if not segments:
+                await interaction.followup.send(f"Nothing buffered for {label}.")
+                return
+            header = (
+                f"🎙️ **{label}** in **{target.name}** — "
+                f"{human_duration(sum(s.duration_ms for s in segments))} across "
+                f"{len(segments)} file(s)."
+            )
+            await _deliver(interaction, bot, target, [(label, segments)], header)
+
+
+class _SpeakerView(discord.ui.View):
+    def __init__(self, bot, guild, target, speakers, minutes, requester_id) -> None:
+        super().__init__(timeout=180)
+        self.requester_id = requester_id
+        self.add_item(_SpeakerSelect(bot, guild, target, speakers, minutes))
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.requester_id:
+            await interaction.response.send_message(
+                "Only whoever ran the command can pick.", ephemeral=True
+            )
+            return False
+        return True
+
+
+@rec_group.command(name="get", description="Send the mixed recording of a voice channel")
 @app_commands.describe(
     channel="Voice channel to export (default: the one you are in)",
     minutes="How far back to go, in minutes (default: the whole buffer)",
@@ -283,7 +530,7 @@ def _resolve_channel(bot: RecordingBot, interaction, explicit):
 async def rec_get(
     interaction: discord.Interaction,
     channel: Optional[discord.VoiceChannel] = None,
-    minutes: Optional[app_commands.Range[float, 0.1, 600.0]] = None,
+    minutes: Optional[app_commands.Range[float, 0.1, 100_000.0]] = None,
 ) -> None:
     bot: RecordingBot = interaction.client  # type: ignore[assignment]
     await interaction.response.defer(thinking=True)
@@ -296,64 +543,124 @@ async def rec_get(
         )
         return
 
-    window_ms = int((minutes or bot.cfg.retention_seconds / 60) * 60_000)
-    since_ms = now_ms() - window_ms
+    async with bot.export_lock(target.id):
+        await _flush_live(bot, interaction.guild_id, target.id)
+        segments = bot.segments_for(
+            interaction.guild_id, target.id, track=MIX_TRACK,
+            since_ms=_since(bot, minutes),
+        )
+        if not segments:
+            await interaction.followup.send(f"Nothing buffered for {target.mention}.")
+            return
+        total = sum(s.duration_ms for s in segments)
+        header = (
+            f"🎙️ **{target.name}** — {human_duration(total)} of speech in "
+            f"{len(segments)} conversation(s), from "
+            f"{discord_time(segments[0].start_ms)} to "
+            f"{discord_time(segments[-1].end_ms)}."
+        )
+        await _deliver(interaction, bot, target, [("", segments)], header)
+
+
+@rec_group.command(
+    name="get-all",
+    description="Send the mixed recording plus every speaker's isolated track",
+)
+@app_commands.describe(
+    channel="Voice channel to export (default: the one you are in)",
+    minutes="How far back to go, in minutes (default: the whole buffer)",
+)
+async def rec_get_all(
+    interaction: discord.Interaction,
+    channel: Optional[discord.VoiceChannel] = None,
+    minutes: Optional[app_commands.Range[float, 0.1, 100_000.0]] = None,
+) -> None:
+    bot: RecordingBot = interaction.client  # type: ignore[assignment]
+    await interaction.response.defer(thinking=True)
+
+    target = _resolve_channel(bot, interaction, channel)
+    if target is None:
+        await interaction.followup.send("No recordings for this server yet.")
+        return
 
     async with bot.export_lock(target.id):
-        recorder = bot.recorders.get(interaction.guild_id)
-        if recorder is not None and recorder.channel_id == target.id:
-            await recorder.flush()  # make the in-progress chunk visible
-
-        chunks = bot.store.list_chunks(
-            interaction.guild_id, target.id, since_ms=since_ms
+        await _flush_live(bot, interaction.guild_id, target.id)
+        since_ms = _since(bot, minutes)
+        jobs: list[tuple[str, list[Segment]]] = []
+        mixed = bot.segments_for(
+            interaction.guild_id, target.id, track=MIX_TRACK, since_ms=since_ms
         )
-        if not chunks:
+        if mixed:
+            jobs.append(("mixed", mixed))
+        for user_id in bot.store.speakers(interaction.guild_id, target.id):
+            segments = bot.segments_for(
+                interaction.guild_id, target.id, track=str(user_id), since_ms=since_ms
+            )
+            if segments:
+                jobs.append((bot.speaker_label(interaction.guild, user_id), segments))
+
+        if not jobs:
+            await interaction.followup.send(f"Nothing buffered for {target.mention}.")
+            return
+
+        limit = bot.upload_limit(interaction.guild)
+        count = _count_files(bot, jobs, limit)
+        header = (
+            f"🎚️ **{target.name}** — mixed plus {len(jobs) - 1} speaker track(s), "
+            f"{count} file(s)."
+        )
+        if count > CONFIRM_ABOVE_FILES:
+            view = _Confirm(interaction.user.id)
             await interaction.followup.send(
-                f"Nothing buffered for {target.mention} in the last "
-                f"{human_duration(window_ms)}."
+                f"That is **{count} files** across {len(jobs)} track(s). "
+                "Send them all, or narrow it with the `minutes:` option?",
+                view=view,
             )
-            return
+            await view.wait()
+            if not view.confirmed:
+                return
+        await _deliver(interaction, bot, target, jobs, header)
 
-        workdir = bot.cfg.data_dir / "exports" / uuid.uuid4().hex
-        try:
-            parts = await export(
-                chunks,
-                workdir,
-                prefix=f"{_safe_name(target.name)}-{slug(chunks[0].start_ms)}",
-                max_bytes=bot.upload_limit(interaction.guild),
-                binary=bot.cfg.ffmpeg,
-                bitrate=bot.cfg.mp3_bitrate,
-            )
-        except Exception as exc:
-            log.exception("export failed for channel %s", target.id)
-            await interaction.followup.send(f"Export failed: `{exc}`")
-            shutil.rmtree(workdir, ignore_errors=True)
-            return
 
-        try:
-            total_ms = sum(c.duration_ms for c in chunks)
-            segments = len({c.segment_ms for c in chunks})
-            header = (
-                f"🎙️ **{target.name}** — {human_duration(total_ms)} of speech in "
-                f"{segments} conversation(s), from {discord_time(chunks[0].start_ms)} "
-                f"to {discord_time(chunks[-1].end_ms)}."
-            )
-            if len(parts) > 1:
-                header += f"\nSplit into {len(parts)} files to fit Discord's upload limit."
-            first = True
-            for offset in range(0, len(parts), MAX_ATTACHMENTS_PER_MESSAGE):
-                batch = parts[offset : offset + MAX_ATTACHMENTS_PER_MESSAGE]
-                files = [discord.File(p.path, filename=p.path.name) for p in batch]
-                caption = " · ".join(_caption(p) for p in batch)
-                if first:
-                    await interaction.followup.send(f"{header}\n{caption}", files=files)
-                    first = False
-                elif interaction.channel is not None:
-                    await interaction.channel.send(content=caption, files=files)
-                else:  # pragma: no cover - the command is guild-only
-                    await interaction.followup.send(caption, files=files)
-        finally:
-            shutil.rmtree(workdir, ignore_errors=True)
+@rec_group.command(
+    name="get-single", description="Pick one person and get only their voice"
+)
+@app_commands.describe(
+    channel="Voice channel to export (default: the one you are in)",
+    minutes="How far back to go, in minutes (default: the whole buffer)",
+)
+async def rec_get_single(
+    interaction: discord.Interaction,
+    channel: Optional[discord.VoiceChannel] = None,
+    minutes: Optional[app_commands.Range[float, 0.1, 100_000.0]] = None,
+) -> None:
+    bot: RecordingBot = interaction.client  # type: ignore[assignment]
+    await interaction.response.defer(thinking=True, ephemeral=True)
+
+    target = _resolve_channel(bot, interaction, channel)
+    if target is None:
+        await interaction.followup.send("No recordings for this server yet.", ephemeral=True)
+        return
+
+    await _flush_live(bot, interaction.guild_id, target.id)
+    speakers = bot.store.speakers(interaction.guild_id, target.id)
+    if not speakers:
+        await interaction.followup.send(
+            f"No isolated tracks for {target.mention}. They are only written while "
+            f"at most {bot.cfg.max_speaker_tracks} different people speak in a "
+            "conversation.",
+            ephemeral=True,
+        )
+        return
+
+    view = _SpeakerView(
+        bot, interaction.guild, target, speakers, minutes, interaction.user.id
+    )
+    extra = "" if len(speakers) <= SELECT_LIMIT else f" (showing {SELECT_LIMIT})"
+    await interaction.followup.send(
+        f"**{target.name}** has {len(speakers)} isolated track(s){extra}:",
+        view=view, ephemeral=True,
+    )
 
 
 @rec_group.command(name="status", description="Show what is being recorded and how much is buffered")
@@ -362,10 +669,12 @@ async def rec_status(interaction: discord.Interaction) -> None:
     await interaction.response.defer(thinking=True, ephemeral=True)
 
     recorder = bot.recorders.get(interaction.guild_id)
+    used = bot.store.total_bytes()
     header = (
-        f"**Rolling buffer:** {human_duration(bot.cfg.retention_ms)} of speech per channel"
-        f" · strategy `{bot.cfg.retention_strategy}`"
+        f"**Buffer:** {human_size(used)} of {human_size(bot.cfg.max_disk_bytes)} used"
+        f" ({100 * used / max(1, bot.cfg.max_disk_bytes):.0f}%)"
         f" · chunks of {human_duration(bot.cfg.chunk_seconds * 1000)}"
+        f" · oldest chunk goes first"
     )
     lines = [header]
 
@@ -383,23 +692,26 @@ async def rec_status(interaction: discord.Interaction) -> None:
             f"{info['segments']} conversation(s) this session · "
             f"{human_duration(info['recorded_seconds'] * 1000)} captured"
         )
+        lines.append(
+            f"**Gate:** speech above RMS {info['silence_rms']}"
+            f" · right now {info['last_rms']}"
+            f" · isolated tracks {'on' if info['tracks'] else 'off (too many speakers)'}"
+        )
 
     buffered = []
     for vc in interaction.guild.voice_channels:
         total = bot.store.total_duration_ms(interaction.guild_id, vc.id)
         if total:
-            size = sum(
-                c.size_bytes
-                for c in bot.store.list_chunks(interaction.guild_id, vc.id)
+            buffered.append(
+                (total, vc, bot.store.total_bytes(interaction.guild_id, vc.id),
+                 len(bot.store.speakers(interaction.guild_id, vc.id)))
             )
-            buffered.append((total, vc, size))
     if buffered:
         lines.append("\n**Buffered:**")
-        for total, vc, size in sorted(buffered, reverse=True, key=lambda i: i[0]):
-            pct = 100 * total / max(1, bot.cfg.retention_ms)
+        for total, vc, size, tracks in sorted(buffered, reverse=True, key=lambda i: i[0]):
             lines.append(
                 f"· {vc.mention} — {human_duration(total)} "
-                f"({pct:.0f}% of target, {human_size(size)})"
+                f"({human_size(size)}, {tracks} speaker track(s))"
             )
     else:
         lines.append("\n**Buffered:** nothing yet.")
@@ -429,7 +741,9 @@ async def rec_list(
         await interaction.followup.send("No recordings for this server yet.", ephemeral=True)
         return
 
-    segments = bot.store.segments(interaction.guild_id, target.id)
+    segments = bot.segments_for(
+        interaction.guild_id, target.id, track=MIX_TRACK, since_ms=None
+    )
     if not segments:
         await interaction.followup.send(
             f"Nothing buffered for {target.mention}.", ephemeral=True
@@ -438,18 +752,69 @@ async def rec_list(
 
     header = (
         f"**{target.name}** — {len(segments)} conversation(s), "
-        f"{human_duration(sum(s.duration_ms for s in segments))} total:"
+        f"{human_duration(sum(s.duration_ms for s in segments))} total. "
+        f"`/rec get` sends one file each."
     )
     lines = [header]
     for segment in segments[-25:]:
         lines.append(
             f"· {discord_time(segment.start_ms, 't')} → "
             f"{discord_time(segment.end_ms, 't')} "
-            f"({human_duration(segment.duration_ms)}, {len(segment.chunks)} chunk(s))"
+            f"({human_duration(segment.duration_ms)}, {human_size(segment.size_bytes)})"
         )
     if len(segments) > 25:
         lines.insert(1, f"_showing the {min(25, len(segments))} most recent_")
     await interaction.followup.send("\n".join(lines), ephemeral=True)
+
+
+@rec_group.command(name="config", description="Read or set the silence gate of a channel")
+@app_commands.describe(
+    channel="Voice channel to configure (default: the one you are in)",
+    silence_rms="Loudness below which audio counts as silence (0-32767)",
+    reset="Go back to the server-wide default",
+)
+async def rec_config(
+    interaction: discord.Interaction,
+    channel: Optional[discord.VoiceChannel] = None,
+    silence_rms: Optional[app_commands.Range[int, 0, 32767]] = None,
+    reset: Optional[bool] = None,
+) -> None:
+    bot: RecordingBot = interaction.client  # type: ignore[assignment]
+    await interaction.response.defer(thinking=True, ephemeral=True)
+
+    target = _resolve_channel(bot, interaction, channel)
+    if target is None:
+        await interaction.followup.send(
+            "Tell me which channel: `/rec config channel:<name>`.", ephemeral=True
+        )
+        return
+
+    if reset:
+        bot.settings.set_silence_rms(target.id, None)
+    elif silence_rms is not None:
+        bot.settings.set_silence_rms(target.id, int(silence_rms))
+
+    effective = bot.settings.silence_rms(target.id, bot.cfg.silence_rms)
+    recorder = bot.recorders.get(interaction.guild_id)
+    live = recorder if recorder is not None and recorder.channel_id == target.id else None
+    if live is not None:
+        live.silence_rms = effective
+
+    override = bot.settings.channel_option(target.id, "silence_rms")
+    now = f" · **right now {live.last_rms}**" if live is not None else ""
+    await interaction.followup.send(
+        f"**{target.name}** silence gate: **{effective}**"
+        f" ({'channel override' if override is not None else 'server default'})"
+        f"{now}\n"
+        "Audio quieter than this counts as silence, and "
+        f"{human_duration(bot.cfg.silence_timeout * 1000)} of it ends a recording.\n"
+        "· `0` — record everything, room noise included\n"
+        f"· `{bot.cfg.silence_rms}` — the default\n"
+        "· `400` — only clear speech; quiet talkers get cut\n"
+        "Open mics in a noisy room want a higher number. Watch **right now** "
+        "while nobody speaks and set the gate just above it.",
+        ephemeral=True,
+    )
 
 
 @rec_group.command(name="purge", description="Delete the buffered recording of a voice channel")

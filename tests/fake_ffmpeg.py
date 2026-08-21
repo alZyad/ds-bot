@@ -1,38 +1,37 @@
 #!/usr/bin/env python3
 """A stand-in for ffmpeg, so the pipeline can be tested without encoding.
 
-It understands just enough of the two command lines dsbot builds:
+It understands just enough of the command lines dsbot builds:
 
-* ``-f s16le ... -i pipe:0 ... out``  copies stdin to ``out``
-* ``-f concat -i list.txt ... out``   concatenates the files listed in ``list.txt``
+* ``-f s16le ... -i pipe:0 ... -f adts out``  copies stdin to ``out``
+* ``-i joined.aac -c copy -f ipod out``       copies the input file to ``out``
+
+It also reproduces the one bit of ffmpeg strictness that has actually bitten us:
+when the output filename has no extension ffmpeg recognises, the container must
+be named explicitly or it refuses to start.  dsbot writes to ``.part`` files, so
+a double that shrugged this off would hide a completely broken encoder.
 """
 
 import sys
 from pathlib import Path
+
+KNOWN_EXTENSIONS = {".mp3", ".m4a", ".aac", ".wav", ".ogg"}
 
 
 def main() -> int:
     argv = sys.argv[1:]
     out = Path(argv[-1])
 
-    # Mimic the one bit of ffmpeg strictness that actually bites: without a
-    # recognisable extension the output container has to be given explicitly.
     input_at = argv.index("-i")
-    output_format = "-f" in argv[input_at:]
-    if out.suffix != ".mp3" and not output_format:
+    if out.suffix not in KNOWN_EXTENSIONS and "-f" not in argv[input_at:]:
         print(f"Unable to choose an output format for '{out}'", file=sys.stderr)
         return 234
 
-    if "concat" in argv:
-        listing = Path(argv[argv.index("-i") + 1])
-        payload = b""
-        for line in listing.read_text().splitlines():
-            line = line.strip()
-            if line.startswith("file '") and line.endswith("'"):
-                payload += Path(line[6:-1]).read_bytes()
-        out.write_bytes(payload)
-    else:
+    source = argv[input_at + 1]
+    if source == "pipe:0":
         out.write_bytes(sys.stdin.buffer.read())
+    else:
+        out.write_bytes(Path(source).read_bytes())
     return 0
 
 

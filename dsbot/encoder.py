@@ -1,9 +1,17 @@
-"""ffmpeg glue: streaming mp3 encoder and export/concatenation helpers.
+"""ffmpeg glue: the streaming chunk encoder and the export path.
 
-Raw PCM is never stored.  Each chunk is encoded on the fly by piping the mixed
-frames straight into an ffmpeg process (48 kHz mono s16le in, mp3 out), which
-keeps 3 hours of speech at roughly 85 MB per channel (64 kbps mono) instead
-of the 2 GB the equivalent 48 kHz stereo PCM would take.
+Raw PCM is never stored.  Each chunk is encoded on the fly by piping frames
+straight into an ffmpeg process (48 kHz mono s16le in, AAC out).
+
+Chunks are written as **ADTS** AAC rather than into an mp4 container, because
+ADTS is a self-framing byte stream: joining chunks is plain concatenation, so
+building an export is a byte copy plus a single stream-copy remux into ``.m4a``
+with no re-encoding anywhere.  AAC because it plays in VLC and Windows Media
+Player alike, and is roughly a third smaller than mp3 at the same quality.
+
+The explicit ``-f adts`` is load-bearing: chunks are written to a ``.part``
+file, so ffmpeg cannot infer the container from the extension and without the
+flag it refuses to start.
 """
 
 from __future__ import annotations
@@ -15,9 +23,12 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-from .store import Chunk
+from .store import Chunk, Segment
 
 log = logging.getLogger(__name__)
+
+CHUNK_SUFFIX = ".aac"
+EXPORT_SUFFIX = ".m4a"
 
 
 class FfmpegError(RuntimeError):
@@ -39,8 +50,8 @@ async def _run(binary: str, *args: str) -> tuple[int, bytes]:
     return proc.returncode or 0, stderr
 
 
-class Mp3Encoder:
-    """A single ffmpeg process turning a PCM stream into one mp3 file."""
+class AudioEncoder:
+    """A single ffmpeg process turning a PCM stream into one ADTS AAC file."""
 
     def __init__(
         self,
@@ -66,11 +77,12 @@ class Mp3Encoder:
             "-ar", str(self.sample_rate),
             "-ac", "1",
             "-i", "pipe:0",
-            "-c:a", "libmp3lame",
+            "-c:a", "aac",
             "-b:a", self.bitrate,
             # The destination is a ".part" file, so the container has to be
-            # named explicitly: ffmpeg cannot guess it from the extension.
-            "-f", "mp3",
+            # named explicitly: ffmpeg cannot guess it from the extension and
+            # exits 234 without this.
+            "-f", "adts",
             "-y", str(self.destination),
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.DEVNULL,
@@ -124,7 +136,7 @@ class Mp3Encoder:
 
 @dataclass(frozen=True)
 class ExportPart:
-    """One mp3 file to upload."""
+    """One file to upload."""
 
     path: Path
     start_ms: int
@@ -144,8 +156,8 @@ class ExportPart:
 def split_for_upload(chunks: Sequence[Chunk], max_bytes: int) -> list[list[Chunk]]:
     """Group chunks into batches whose concatenation fits an attachment.
 
-    Because every chunk is already a standalone mp3 we can size the parts from
-    the files themselves instead of guessing at a bitrate.
+    Because every chunk is already a standalone AAC stream we can size the
+    parts from the files themselves instead of guessing at a bitrate.
     """
     batches: list[list[Chunk]] = []
     current: list[Chunk] = []
@@ -170,39 +182,41 @@ async def concat(
     bitrate: str = "64k",
     workdir: Path | None = None,
 ) -> Path:
-    """Concatenate mp3 chunks into one file, re-encoding only if needed."""
+    """Join ADTS chunks and remux them into one ``.m4a``, without re-encoding."""
     if not chunks:
         raise FfmpegError("nothing to concatenate")
 
     workdir = workdir or destination.parent
     workdir.mkdir(parents=True, exist_ok=True)
-    listing = workdir / f"{destination.stem}.concat.txt"
-    listing.write_text(
-        "".join(f"file '{c.path.resolve().as_posix()}'\n" for c in chunks),
-        encoding="utf-8",
-    )
-    common = ("-hide_banner", "-loglevel", "error", "-f", "concat", "-safe", "0",
-              "-i", str(listing))
+    joined = workdir / f"{destination.stem}.joined{CHUNK_SUFFIX}"
     try:
+        with joined.open("wb") as out:
+            for chunk in chunks:
+                try:
+                    with chunk.path.open("rb") as src:
+                        shutil.copyfileobj(src, out)
+                except OSError:  # a chunk trimmed away mid-export
+                    log.warning("skipping unreadable chunk %s", chunk.path)
+        common = ("-hide_banner", "-loglevel", "error", "-i", str(joined))
         code, stderr = await _run(
-            binary, *common, "-c", "copy", "-y", str(destination)
+            binary, *common, "-c", "copy", "-f", "ipod", "-y", str(destination)
         )
         if code != 0 or not destination.exists():
-            # Mixed bitrates / a truncated chunk can defeat stream copy.
+            # A truncated final chunk can defeat stream copy.
             log.info("stream copy failed (%s), re-encoding", code)
             code, stderr = await _run(
-                binary, *common, "-c:a", "libmp3lame", "-b:a", bitrate,
-                "-y", str(destination),
+                binary, *common, "-c:a", "aac", "-b:a", bitrate,
+                "-f", "ipod", "-y", str(destination),
             )
         if code != 0 or not destination.exists():
             raise FfmpegError(stderr.decode(errors="replace")[:500] or "ffmpeg failed")
     finally:
-        listing.unlink(missing_ok=True)
+        joined.unlink(missing_ok=True)
     return destination
 
 
 async def export(
-    chunks: Sequence[Chunk],
+    segments: Sequence[Segment],
     workdir: Path,
     *,
     prefix: str,
@@ -210,25 +224,29 @@ async def export(
     binary: str = "ffmpeg",
     bitrate: str = "64k",
 ) -> list[ExportPart]:
-    """Build the uploadable mp3 parts for a set of chunks."""
-    ordered = sorted(chunks)
-    if not ordered:
+    """Build one uploadable file per segment, splitting only oversized ones."""
+    if not segments:
         return []
     workdir.mkdir(parents=True, exist_ok=True)
-    batches = split_for_upload(ordered, max_bytes)
     parts: list[ExportPart] = []
-    for index, batch in enumerate(batches, start=1):
-        suffix = "" if len(batches) == 1 else f"-part{index:02d}"
-        destination = workdir / f"{prefix}{suffix}.mp3"
-        await concat(batch, destination, binary=binary, bitrate=bitrate, workdir=workdir)
-        parts.append(
-            ExportPart(
-                path=destination,
-                start_ms=batch[0].start_ms,
-                end_ms=batch[-1].end_ms,
-                duration_ms=sum(c.duration_ms for c in batch),
-                index=index,
-                total=len(batches),
+    numbered = len(segments) > 1
+    for position, segment in enumerate(segments, start=1):
+        batches = split_for_upload(segment.chunks, max_bytes)
+        stem = f"{prefix}-{position:02d}" if numbered else prefix
+        for index, batch in enumerate(batches, start=1):
+            suffix = "" if len(batches) == 1 else f"-part{index:02d}"
+            destination = workdir / f"{stem}{suffix}{EXPORT_SUFFIX}"
+            await concat(
+                batch, destination, binary=binary, bitrate=bitrate, workdir=workdir
             )
-        )
+            parts.append(
+                ExportPart(
+                    path=destination,
+                    start_ms=batch[0].start_ms,
+                    end_ms=batch[-1].end_ms,
+                    duration_ms=sum(c.duration_ms for c in batch),
+                    index=index,
+                    total=len(batches),
+                )
+            )
     return parts

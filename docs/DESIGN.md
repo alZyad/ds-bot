@@ -1,12 +1,10 @@
 # Design
 
 The decisions behind the recorder, and why. Written after a design review that
-walked the whole tree; it supersedes the original `README.md` description
-wherever the two disagree.
+walked the whole tree, and kept as the record of *why* each choice was made —
+`README.md` describes what the bot does, this describes what was rejected.
 
-Status: **agreed, not yet implemented.** The code currently implements the
-superseded design (mp3, 3h speech-duration buffer, per-channel retention,
-mixed track only).
+Status: **implemented.**
 
 ## Recording
 
@@ -77,9 +75,16 @@ talked, so occupancy is the wrong denominator. A 10-person channel where 3
 people talk gets 3 tracks.
 
 If a 7th distinct speaker talks mid-segment, per-speaker recording **stops** and
-the partial tracks already written are kept. Deleting them would throw away good
-audio; continuing without the newcomer would produce tracks that silently omit a
+the tracks already written are kept. Deleting them would throw away good audio;
+continuing without the newcomer would produce tracks that silently omit a
 participant, which is worse than none because you cannot tell by looking.
+
+The open tracks are *frozen* rather than closed: they keep receiving silence to
+the end of the chunk in progress, and no new one is opened for the rest of the
+segment. Closing them on the spot would leave them shorter than the mix for that
+chunk, and because export can merge two segments into one file, a short chunk
+would shift every later frame of that speaker earlier than the mix it is meant
+to line up with.
 
 Alignment is free: the recorder runs a wall-clock pump emitting exactly one 20ms
 frame per 20ms of real time, so every track fed from that pump is sample-aligned
@@ -151,3 +156,50 @@ The bot announces when it starts and stops recording in the channel it is
 recording. Recording people without their knowledge is a legal question in many
 jurisdictions, not merely a courtesy; the announcement is on by default and
 turning it off is the operator's decision and responsibility.
+
+## Implementation notes
+
+Decisions taken while writing the code, recorded so they can be revisited.
+
+**Chunks are ADTS AAC (`.aac`), remuxed to `.m4a` on export.** ADTS is a raw
+framed stream, so joining chunks is byte concatenation followed by a single
+stream-copy remux — no re-encode anywhere on the export path. Measured cost:
+about 27ms of encoder padding per chunk boundary (three 2s chunks concatenate to
+6.08s), which over a 12h buffer of 60s chunks accumulates to roughly 20 seconds
+of drift against wall clock. Accepted; the alternative is re-encoding every
+export.
+
+**`-f adts` is load-bearing.** Chunks are written to a `.part` file and renamed,
+so ffmpeg cannot infer the container from the extension. Without the explicit
+flag it exits 234 with "Unable to choose an output format" and every chunk
+silently fails to encode. The same trap previously shipped as a bug with mp3.
+
+**One directory per channel, the track encoded in the filename:**
+`c<start_ms>_d<duration_ms>_s<segment_ms>_t<mix|user_id>.aac`. One glob and one
+regex read the whole buffer. Chunks sharing a `start_ms` form a *group*;
+retention deletes whole groups, so a speaker track can never outlive the mixed
+chunk it belongs to.
+
+**Chunk rotation is synchronised across every open encoder**, so all tracks in a
+group share a start and duration. This is an invariant worth keeping: every
+track in a chunk is exactly as long as that chunk's mix, no matter when its
+speaker started talking or when the speaker limit was hit.
+
+**Speaker tracks are written with silence** for the frames that speaker is
+quiet. This is what makes the tracks timeline-aligned with each other and with
+the mix, at the cost of storing silence. AAC makes that cheap but not free.
+
+**The limiter has no lookahead beyond the current frame.** Attack applies the
+full required gain to the whole 20ms frame, which guarantees the frame cannot
+clip; release creeps back over roughly 200ms. The worst artefact is a 20ms gain
+step at the onset of crosstalk, which is inaudible next to the clipping it
+replaces. Fast path: when the summed peaks of all tracks cannot exceed full
+scale, the mix is a straight `audioop.add` with no limiting work at all.
+
+**Settings live in `settings.json` beside the recordings, not inside them**, so
+`/rec purge` cannot destroy a tuned threshold or the speaker name cache.
+
+**Environment variables changed.** `MP3_BITRATE` became `AUDIO_BITRATE`;
+`RETENTION_SECONDS`, `RETENTION_STRATEGY`, `HIGH_WATER_SLACK` and
+`LOW_WATER_SLACK` are gone; `MAX_DISK_MB`, `LEAVE_GRACE`, `MAX_SPEAKER_TRACKS`
+and `MERGE_GAP_SECONDS` are new. Existing `.env` files need updating.

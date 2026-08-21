@@ -1,46 +1,46 @@
 # ds-bot — a Discord voice recording buffer
 
 A Python bot that watches every voice channel of a server, records the
-conversation whenever **two or more people** are in one, keeps a **rolling
-~3 hour buffer** of what was said, and hands it back as **mp3 in chat** on
-demand.
+conversation whenever **two or more people** are in one, keeps a rolling buffer
+of what was said, and hands it back as **playable audio in chat** on demand —
+the mixed conversation, or each person's voice on its own.
 
 ```
 voice packets (per user, 20 ms)
         │
         ▼
-   Mixer ─── one mixed mono frame every 20 ms (wall-clock anchored)
-        │
+   Mixer ─── one mixed mono frame + one frame per speaker, every 20 ms
+        │     (wall-clock anchored, peak-limited mix)
         ▼
    Segment state machine ─── opens on speech, closes after 5 s of silence
         │
         ▼
-   Chunks (60 s of speech each) ──▶ ffmpeg ──▶ data/<guild>/<channel>/*.mp3
+   Chunks (60 s each) ──▶ ffmpeg ──▶ data/recordings/<guild>/<channel>/*.aac
+        │                            one file per track: mix + each speaker
+        ▼
+   Retention ─── delete the oldest chunk while the buffer exceeds MAX_DISK_MB
         │
         ▼
-   Retention ─── drop the oldest audio once the buffer passes ~3 h
-        │
-        ▼
-   /rec get ──▶ concatenate ──▶ upload to the text channel
+   /rec get ──▶ join ──▶ remux to .m4a ──▶ upload, one file per conversation
 ```
+
+The full rationale, including the alternatives that were rejected, is in
+[`docs/DESIGN.md`](docs/DESIGN.md).
 
 ## Behaviour
 
 | Requirement | How it works |
 | --- | --- |
 | Detect how many people are in each audio channel | `on_voice_state_update` plus a 20 s reconciliation sweep count non-bot members of every voice/stage channel. |
-| Record when 2+ people are present | The bot joins the busiest eligible channel and starts recording. Threshold is `MIN_SPEAKERS`. |
+| Record when 2+ people are present | The bot joins the first channel to become eligible and stays there. Threshold is `MIN_SPEAKERS`. |
 | Stop on 5 s of silence, resume as soon as someone talks | The silence that follows speech is *buffered*, not written. If someone speaks again within `SILENCE_TIMEOUT` the pause is replayed into the recording (natural rhythm kept); otherwise it is dropped and the segment is closed. The next word opens a new segment on the very next 20 ms frame — there is no restart latency, because the bot never actually leaves the channel. |
-| Keep a ~3 h buffer, dropping old bits | Recording is written as 60 s mp3 chunks. After each chunk the retention policy deletes the oldest audio. See [Retention strategies](#retention-strategies). |
-| A command to get the recordings as mp3 | `/rec get` concatenates the buffer of a channel and posts it, split into as many mp3 files as Discord's attachment limit requires. |
-
-Everyone in the channel is mixed into **one** mono timeline, so an export is a
-single conversation you can listen to, not one file per participant.
+| Keep a bounded buffer, dropping old bits | Audio is written as 60 s chunks. Whenever the total exceeds `MAX_DISK_MB` the oldest chunk is deleted. One rule, no strategies to choose between. |
+| A command to get the recordings in chat | `/rec get` posts the mixed recording, one file per conversation. `/rec get-all` adds every speaker's isolated track; `/rec get-single` gives you a dropdown to pick one person. |
 
 ## Requirements
 
 * Python 3.11+
-* `ffmpeg` on `PATH` (does all mp3 encoding and concatenation)
+* `ffmpeg` on `PATH` (does all encoding and remuxing)
 * `libopus` and `libsodium` (installed with `discord.py[voice]` on most
   platforms; on Debian/Ubuntu: `apt install libopus0 libsodium23`)
 
@@ -74,95 +74,86 @@ Slash commands are synced on startup and may take a minute to appear.
 
 | Command | What it does |
 | --- | --- |
-| `/rec get [channel] [minutes]` | Post the buffered recording as mp3. Defaults to the channel you are in and the whole buffer. Splits into `part01…partNN` when it does not fit one attachment. |
-| `/rec status` | What is being recorded right now, how much is buffered per channel, who is where. Ephemeral. |
-| `/rec list [channel]` | The conversations currently in the buffer, with their timestamps and durations. Ephemeral. |
+| `/rec get [channel] [minutes]` | The mixed recording, one `.m4a` per conversation. Defaults to the channel you are in and the whole buffer. |
+| `/rec get-all [channel] [minutes]` | The mix plus every speaker's isolated track. Asks for confirmation past 10 files. |
+| `/rec get-single [channel] [minutes]` | A dropdown of who has audio buffered; pick one and get only their voice. |
+| `/rec status` | What is being recorded, the live loudness reading, how much is buffered. Ephemeral. |
+| `/rec list [channel]` | The conversations in the buffer with timestamps and sizes — one file each when exported. Ephemeral. |
+| `/rec config [channel] [silence_rms] [reset]` | Read or set the silence gate for a channel. Ephemeral. |
 | `/rec purge [channel]` | Delete a channel's buffer. Requires **Manage Server**. |
 
-`/rec get` flushes the in-progress chunk first, so it always includes the
+`/rec get*` flushes the in-progress chunk first, so it always includes the
 sentence that just finished.
 
-## Retention strategies
+**There is no permission check on the `get` commands.** That is deliberate for a
+small private server: anyone can pull any channel's audio. If your members are
+not all mutually trusted, gate them on `view_channel` + `connect` for the target
+channel so people can only pull audio from rooms they could have walked into.
 
-The buffer is a **ring of small files**, not one big file: audio is written as
-`CHUNK_SECONDS` (60 s by default) mp3 chunks named
-`c<start>_d<duration>_s<segment>.mp3`, and expiring audio means `unlink`-ing
-the oldest chunk. That choice is what makes the three policies below cheap —
-each one only decides *which* chunks to drop, in `plan_trim()`
-(`dsbot/store.py`), a pure function with unit tests.
+## Retention
 
-Set `RETENTION_STRATEGY` to pick one:
+One rule:
 
-### `oldest-chunk` (default)
+> While the buffer is larger than `MAX_DISK_MB`, delete the oldest chunk.
 
-Drop the oldest chunk until the buffer is back under `RETENTION_SECONDS`.
+The buffer is a **ring of small files**, not one big file, which is what makes
+that cheap: expiring audio is an `unlink`, not a rewrite. Chunks sharing a start
+time form a *group* — the mix plus the speaker tracks covering that moment — and
+a group is always deleted whole, so a speaker track can never outlive its mix.
 
-* Overshoot is at most one chunk, so the buffer sits between 2 h 59 m and 3 h.
-* One `unlink` per minute of recording: negligible IO.
-* Trade-off: the oldest surviving conversation may start mid-sentence. Nothing
-  large is ever lost — you lose a minute at the far end of the window.
-* Tighten or loosen the fluctuation with `CHUNK_SECONDS`: 30 s chunks halve the
-  swing, 5 min chunks quarter the number of files.
+The last remaining group is never deleted, so a budget smaller than one chunk
+degrades to "hold one chunk" rather than to an empty buffer.
 
-### `oldest-segment`
-
-Drop whole conversations, oldest first, never a partial one.
-
-* What you keep is always a set of complete discussions — good if you export to
-  hand recordings to people, since no file ever begins mid-word.
-* Trade-off: the buffer swings by the length of a whole conversation. After
-  dropping a 40 min meeting you are at 2 h 20 m, not 3 h. It also cannot help
-  with a single meeting longer than the retention target, so it falls back to
-  chunk granularity inside the last remaining segment.
-
-### `high-water`
-
-Do nothing until the buffer exceeds `RETENTION_SECONDS + HIGH_WATER_SLACK`,
-then trim down to `RETENTION_SECONDS - LOW_WATER_SLACK` in one pass.
-
-* Fewest delete operations, and trimming happens in bursts instead of every
-  minute — the friendliest option for network storage or a spinning disk.
-* Trade-off: the widest fluctuation. With the default 15 min slacks the buffer
-  moves between 2 h 45 m and 3 h 15 m.
-
-### Considered and rejected
-
-* **One rolling file, truncate the head.** Dropping the first minute of a single
-  long mp3 means rewriting the whole file: O(buffer) IO every minute, plus mp3
-  frame-boundary and ID3 problems. The chunk ring gets the same result with one
-  `unlink`.
-* **Fixed ring of N preallocated slots.** Bounds disk exactly, but overwriting a
-  slot while an export is reading it is a race, and mp3 is variable size anyway
-  so "N slots" does not actually bound the duration.
-* **Wall-clock window** (keep everything from the last 3 hours) instead of a
-  duration window (keep 3 hours *of speech*). Simpler, but a channel used
-  10 minutes per hour would retain only ~30 minutes of discussion. Since silence
-  is never stored, the duration window is what "3 hours of recordings" actually
-  means.
-* **Byte quota per channel.** Easy disk planning, but with variable bitrate you
-  no longer know how much conversation you are keeping.
-
-### Natural extension
-
-**Tiered quality.** Nothing in the layout stops you from re-encoding chunks
-older than an hour down to 24 kbps mono: chunks are independent files, and the
-duration lives in the filename, so a background task could triple the retained
-history at the same disk cost. Not implemented, because it trades CPU for
-history and the default 3 h already fits in ~85 MB per channel.
+The cost of chunk-granularity deletion is that the oldest file may begin
+mid-sentence. That is cosmetic, and it only ever affects the oldest audio.
+Several cleverer schemes were tried on paper first and rejected — a speech-
+duration window, a "never drop below N hours" floor, a segment count cap, and
+whole-segment deletion; [`docs/DESIGN.md`](docs/DESIGN.md#retention) explains
+why each one is worse.
 
 ## Storage
 
-Audio is mixed to 48 kHz **mono** and encoded straight into ffmpeg's stdin —
-raw PCM never touches the disk.
+Audio is mixed to 48 kHz **mono** and encoded straight into ffmpeg's stdin — raw
+PCM never touches the disk. Chunks are **AAC in an ADTS stream**, remuxed to
+`.m4a` on export.
 
-| Format | Per hour of speech | 3 h buffer |
+AAC because it plays in VLC and Windows Media Player alike and is roughly a
+third smaller than mp3 at the same quality. ADTS because it is self-framing, so
+joining chunks is byte concatenation plus one stream-copy remux — nothing is
+re-encoded on the way out.
+
+| | Per hour of talking | 1 GiB budget |
 | --- | --- | --- |
-| 48 kHz stereo PCM (what Discord sends) | 691 MB | 2.0 GB |
-| 48 kHz mono PCM | 346 MB | 1.0 GB |
-| **mp3 64 kbps mono (default)** | **29 MB** | **86 MB** |
-| mp3 32 kbps mono | 14 MB | 43 MB |
+| 48 kHz stereo PCM (what Discord sends) | 691 MB | 1.5 h |
+| **AAC 64 kbps, mix only** | **29 MB** | **~36 h** |
+| AAC 64 kbps, mix + 6 speaker tracks | 86 MB | ~12 h |
 
-Only *speech* counts: an idle channel costs nothing.
+Only *speech* counts: an idle channel costs nothing. Quality is capped upstream
+— Discord encodes each microphone to roughly 64 kbps Opus before it reaches us,
+so spending more bits here preserves detail that is already gone.
+
+## Isolated tracks
+
+Alongside the mix, each speaker gets their own file while a conversation has no
+more than `MAX_SPEAKER_TRACKS` (6) distinct speakers. Distinct *speakers*, not
+channel occupants: a track only exists because somebody talked, so a 10-person
+channel where 3 people speak gets 3 tracks.
+
+Alignment is free. The recorder pulls exactly one frame per 20 ms of real time
+and feeds every track from that same pull, so all of them share one
+sample-accurate timeline. A speaker first heard part-way through a chunk gets
+silence back-filled to the chunk start; if the speaker limit is exceeded
+mid-chunk the open tracks are frozen with silence to the end of it. Either way,
+every track in a chunk is exactly as long as that chunk's mix.
+
+When the limit is exceeded, what was already captured is kept and no further
+track is opened for the rest of the conversation. Tracks are reconsidered from
+scratch for the next one. The mix always records everyone regardless.
+
+The mix is peak-limited: adding several voices together can exceed full scale,
+and chopping the peaks off — which is what a plain 16-bit sum does — sounds like
+crackling exactly during the crosstalk you most want to replay. Isolated tracks
+are never summed with anything, so they are always an unlimited copy.
 
 ## Configuration
 
@@ -174,42 +165,52 @@ Every value is read from the environment (or a `.env` file); see
 | `DISCORD_TOKEN` | — | Bot token (required) |
 | `MIN_SPEAKERS` | `2` | People needed before recording starts |
 | `SILENCE_TIMEOUT` | `5.0` | Seconds of silence that end a segment |
-| `SILENCE_RMS` | `150` | Amplitude gate; `0` trusts Discord's own voice detection only |
-| `RETENTION_SECONDS` | `10800` | Target buffer per channel (3 h) |
-| `RETENTION_STRATEGY` | `oldest-chunk` | `oldest-chunk` / `oldest-segment` / `high-water` |
+| `SILENCE_RMS` | `150` | Default amplitude gate; override per channel with `/rec config` |
+| `LEAVE_GRACE` | `5.0` | Seconds to wait before leaving a channel that emptied |
+| `MAX_DISK_MB` | `1024` | The whole buffer budget, across every channel |
 | `CHUNK_SECONDS` | `60` | Chunk size, i.e. deletion granularity |
-| `HIGH_WATER_SLACK` / `LOW_WATER_SLACK` | `900` | Band for `high-water` |
-| `MP3_BITRATE` | `64k` | Encoder bitrate |
+| `MAX_SPEAKER_TRACKS` | `6` | Speakers per conversation before isolated tracks stop; `0` disables them |
+| `AUDIO_BITRATE` | `64k` | AAC bitrate |
 | `MAX_UPLOAD_MB` | `9.0` | Attachment cap; the guild's real limit wins if lower |
-| `DATA_DIR` | `./data` | Where chunks and temporary exports live |
+| `MERGE_GAP_SECONDS` | `120` | Conversations closer than this merge into one export file |
+| `DATA_DIR` | `./data` | Where chunks, settings and temporary exports live |
 | `ANNOUNCE` | `true` | Post a notice in the channel when recording starts/stops |
 | `INCLUDE_CHANNEL_IDS` / `EXCLUDE_CHANNEL_IDS` | — | Allow / deny lists of voice channel ids |
+
+`SILENCE_RMS` per-channel overrides and the speaker name cache live in
+`DATA_DIR/settings.json`, outside the recordings, so `/rec purge` cannot destroy
+a tuned threshold.
 
 ## Design notes
 
 * **Wall-clock alignment.** The pump asks the mixer for exactly one frame per
   20 ms of real time, anchored to a monotonic clock, so a busy event loop does
   not stretch the recording. If it ever falls more than a second behind it
-  re-anchors instead of spinning to catch up, and counts the event
-  (`late_resyncs` in `/rec status`).
+  re-anchors instead of spinning to catch up, and counts the event.
 * **Bounded memory.** Per-user packet buffers hold 400 ms; a client that floods
   drops its *oldest* audio rather than growing without limit.
 * **Crash safety.** A chunk being written is a `.part` file, invisible to
   readers, and becomes visible by an atomic rename once ffmpeg has flushed it.
   Leftovers from a crash are swept at startup. There is no index to corrupt —
-  timing metadata lives in the filenames.
+  all timing metadata lives in the filenames.
 * **One channel per server at a time.** Discord allows a bot one voice
-  connection per guild. The bot picks the busiest eligible channel and then
-  *stays there* while it remains eligible, even if another channel gets busier —
-  hopping would cut the conversation already being captured. To cover several
-  channels of one server simultaneously, run several bot applications with
-  complementary `INCLUDE_CHANNEL_IDS`.
-* **Silence is never stored**, so a 3 h buffer is 3 h of actual talking.
-* **Chunk-boundary padding.** Concatenating mp3 files adds up to one encoder
-  frame (~26 ms) of padding per boundary, so a 3 h export can run a few seconds
-  longer than the sum of its chunks. Audible content is unaffected. Larger
-  `CHUNK_SECONDS` reduces it; switching the chunk format to Opus in an Ogg
-  container would remove it, at the cost of Discord not previewing the file.
+  connection per guild. The bot follows the *first* channel to become eligible
+  and stays there while it remains so, even if another gets busier — hopping
+  would cut the conversation already being captured. A second busy channel is
+  therefore **not recorded**; to cover several at once, run several bot
+  applications with complementary `INCLUDE_CHANNEL_IDS`.
+* **A blip does not sever the recording.** Dropping below `MIN_SPEAKERS` starts
+  a `LEAVE_GRACE` countdown rather than an immediate disconnect, so a reconnect
+  or a channel move does not split the conversation in two.
+* **Silence is never stored**, so the buffer holds actual talking.
+* **Chunk-boundary padding.** Joining AAC chunks adds about one encoder frame
+  (~27 ms) of padding per boundary, so a long export runs slightly longer than
+  the sum of its chunks — roughly 20 s over a 12 h buffer of 60 s chunks.
+  Audible content is unaffected. A larger `CHUNK_SECONDS` reduces it.
+* **The silence gate is not optional.** `voice-recv` delivers packets whenever a
+  client transmits, so an always-open microphone in a noisy room transmits
+  continuously. Without the RMS gate the 5 s rule would never fire and every
+  session would be one unbroken segment of mostly dead air.
 
 ## Recording people
 
@@ -226,11 +227,13 @@ pip install pytest pytest-asyncio
 python -m pytest
 ```
 
-The suite covers the mixer, the segment/silence state machine, chunk rotation,
-all three retention strategies, export splitting, and the
-"how many people are in this channel" logic. It needs no Discord connection, and
-no ffmpeg either: `tests/fake_ffmpeg.py` stands in for the encoder, so the whole
-pipeline is exercised end to end.
+The suite covers the mixer and limiter, the segment/silence state machine, chunk
+rotation, track alignment and the speaker limit, retention, export splitting and
+segment merging, the settings store, and the "how many people are in this
+channel" logic. It needs no Discord connection, and no ffmpeg either:
+`tests/fake_ffmpeg.py` stands in for the encoder, so the whole pipeline is
+exercised end to end.
 
 `tests/test_ffmpeg_real.py` runs the same path against the actual binary and is
-skipped when ffmpeg is missing — a stub cannot catch a wrong ffmpeg invocation.
+skipped when ffmpeg is missing — a stub cannot catch a wrong ffmpeg invocation,
+and that has already cost this project one shipped bug.
