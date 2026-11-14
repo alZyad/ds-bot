@@ -493,3 +493,30 @@ def test_speakers_are_listed_in_their_session(bot):
     bot.remember_speaker(guild, 7, 5_000)
     bot.remember_speaker(guild, 8, 5_000)
     assert bot.store.people(100, 5_000) == [7, 8]
+
+
+# -- presence ---------------------------------------------------------------
+
+def test_the_status_says_how_many_people_are_recorded(bot, monkeypatch):
+    assert bot.presence_text() is None
+    channel = FakeChannel(1, members=[FakeMember(1), FakeMember(2), FakeMember(50)])
+    guild = guild_with(channel)
+    connected(guild, 1, bot)
+    monkeypatch.setattr(bot, "get_guild", lambda guild_id: guild)
+    assert bot.presence_text() == "🔴 Recording 2 people"
+    channel.members = [FakeMember(1), FakeMember(50)]
+    assert bot.presence_text() == "🔴 Recording 1 person"
+
+
+async def test_the_status_is_only_sent_when_it_changes(bot, monkeypatch):
+    sent = []
+
+    async def change_presence(activity=None):
+        sent.append(activity.name if activity else None)
+
+    monkeypatch.setattr(bot, "change_presence", change_presence)
+    texts = iter(["🔴 Recording 2 people", "🔴 Recording 2 people", None])
+    monkeypatch.setattr(bot, "presence_text", lambda: next(texts))
+    for _ in range(3):
+        await bot._update_presence()
+    assert sent == ["🔴 Recording 2 people", None]

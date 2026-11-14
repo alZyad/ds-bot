@@ -56,6 +56,7 @@ class RecordingBot(commands.Bot):
         self._sessions: dict[int, int] = {}
         self._left_at: dict[int, int] = {}
         self._announced: dict[int, set[int]] = {}
+        self._presence: str | None = None
 
     # -- setup --------------------------------------------------------------
 
@@ -193,6 +194,29 @@ class RecordingBot(commands.Bot):
         )
 
     async def reconcile(self, guild: discord.Guild) -> None:
+        await self._reconcile(guild)
+        await self._update_presence()
+
+    def presence_text(self) -> str | None:
+        people = 0
+        for guild_id, recorder in self.recorders.items():
+            guild = self.get_guild(guild_id)
+            channel = guild.get_channel(recorder.channel_id) if guild else None
+            if channel is not None:
+                people += len(self.recorded_in(channel))
+        if not self.recorders:
+            return None
+        return f"🔴 Recording {people} {'person' if people == 1 else 'people'}"
+
+    async def _update_presence(self) -> None:
+        text = self.presence_text()
+        if text == self._presence:
+            return
+        self._presence = text
+        with contextlib.suppress(Exception):
+            await self.change_presence(activity=discord.CustomActivity(name=text) if text else None)
+
+    async def _reconcile(self, guild: discord.Guild) -> None:
         """Make the voice connection match who is actually talking where.
 
         Stability beats optimality: while the channel we are recording is still
@@ -414,7 +438,7 @@ async def record_me(interaction: discord.Interaction) -> None:
         interaction,
         f"🎙️ {user.mention} opted in: I record their voice whenever they're in a voice "
         "channel with someone else. `/record-me` to join them, `/stop-recording-me` "
-        "to stop." + (" Recording them now." if here else ""),
+        "to stop, `/recordings` to listen." + (" Recording them now." if here else ""),
         public=True,
     )
     await bot.reconcile(guild)

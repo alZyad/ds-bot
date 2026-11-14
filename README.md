@@ -34,7 +34,7 @@ Why each piece is the way it is: [`docs/DESIGN.md`](docs/DESIGN.md).
 | --- | --- |
 | Who is recorded | Nobody by default. `/record-me` opts you in for the server, `/stop-recording-me` opts you out. Both answer publicly. Other people's voices never reach the recorder, checked on every packet. |
 | When it joins | A voice channel with **2+ people**, at least one of them opted in. One channel per server, first come first served, no hopping. |
-| What it says | On joining, the voice channel's chat gets "Recording in X: @A, @B. Nobody else in here is recorded." Someone opting in later is announced there once. On leaving, a link to the session. |
+| What it says | On joining, the voice channel's chat gets "Recording in X: @A, @B. Nobody else in here is recorded." Someone opting in later is announced there once. On leaving, a link to the session. While recording, the bot's status reads "🔴 Recording N people". |
 | Silence | Segments close after `SILENCE_TIMEOUT` of silence; dead air is never stored. |
 | Sessions | A session ends once the bot has been out of voice for `SESSION_GAP_SECONDS` (5 min). Rejoining sooner, or moving channel, continues it. |
 | Storage | While the total exceeds `MAX_DISK_MB` (10 GiB), the oldest session is deleted whole. The newest session of a server is never deleted. |
