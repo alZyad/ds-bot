@@ -8,13 +8,23 @@ Status: **implemented.**
 
 ## Recording
 
+**Opt-in, per person, per server.** Nobody is recorded until they run
+`/record-me`; `/stop-recording-me` undoes it. Both replies are public, so the
+server sees who is recorded. The filter sits on every voice packet and reads
+the live opt-in list, so opting out takes effect mid-sentence and a
+non-consenting voice never reaches the mixer, the disk or the merged file.
+
+Rejected: recording everyone and filtering on export. The merged file cannot be
+un-mixed, so consent has to be enforced before mixing.
+
 **One channel per server, first come first served.** Discord allows a bot one
 voice connection per guild, so a busy server can have a conversation we do not
 capture. We join the first channel that becomes eligible and stay there until
 it empties, rather than hopping to whichever channel is busiest — hopping would
 cut the conversation already in progress, and that is the loss that matters.
 
-**Eligible means 2 or more humans** (bots and ourselves excluded).
+**Eligible means 2 or more humans, at least one opted in** (bots and ourselves
+excluded). One opted-in person alone is a monologue, not a conversation.
 
 **No pre-roll.** We are not connected at one person, so joining costs a second
 or two of the opening. Accepted: losing the first few seconds is cheap.
@@ -38,9 +48,8 @@ transmits, so an always-open mic in a noisy room transmits continuously and
 without the gate the 5s rule would never fire — every session would be one
 unbroken segment of mostly dead air.
 
-The threshold defaults to 150 on a 0..32767 scale and is configurable per
-channel via `/rec config`, persisted to JSON in the data directory, because a
-gaming channel with open mics needs a very different gate from a call.
+The threshold defaults to 150 on a 0..32767 scale and is set with `SILENCE_RMS`.
+A per-channel runtime override existed and was dropped with the `/rec` commands.
 
 - `0` records everything including room noise
 - `150` default
@@ -90,72 +99,70 @@ Alignment is free: the recorder runs a wall-clock pump emitting exactly one 20ms
 frame per 20ms of real time, so every track fed from that pump is sample-aligned
 by construction.
 
+## Sessions
+
+A *session* is everything recorded in a server between the bot joining voice and
+the bot having been out of voice for 5 minutes. Moving channel, a reconnect or a
+short break keeps the session. The leave time is tracked in memory; after a
+restart the end of the newest chunk stands in for it.
+
+Sessions are what people ask for ("last night's call"), so they are the unit of
+listing, linking and deletion.
+
 ## Retention
 
-**Delete the oldest 60s chunk while total size exceeds `MAX_DISK_MB` (1GB).**
+**Delete the oldest whole session while total size exceeds `MAX_DISK_MB`
+(10 GiB).** The newest session of each server is never deleted, so the session
+being recorded cannot vanish under the recorder.
 
-That is the entire rule. 1GB holds roughly 12 hours of talking with mixed plus
-six speaker tracks.
+Sizing: 5 h of 5 people talking is about 0.9 GB (mix plus five tracks), so the
+live session and the previous one together stay under 2 GB, far below the cap.
 
-Rejected along the way:
+This replaces the earlier chunk-granular ring buffer. Whole-session deletion was
+rejected then for its cliffs, one deletion wiping half of a 1 GB history; at
+10 GiB a session is a small fraction of the budget, and a session that starts
+mid-sentence is worse than one that is gone.
 
-- *A 3h buffer of speech duration.* Per-channel and unbounded in total; a busy
-  server could hold 30h.
-- *"Keep at least 3h, only drop a whole segment if what remains still exceeds
-  3h."* Elegant — it guarantees a floor and never cuts mid-sentence — but
-  segments are unbounded, so a single marathon segment means nothing is ever
-  deleted, and capping segment length to fix that reintroduces the mid-sentence
-  cuts the rule existed to avoid.
-- *A limit of N segments.* Segment length varies by three orders of magnitude,
-  so 10 segments is anywhere from 5 minutes to 50 hours. It bounds neither
-  storage nor history.
-- *Whole-segment deletion under a disk cap.* Cliffs: if 1GB is two large
-  segments, one deletion wipes half the history.
+## Delivery
 
-Chunk deletion costs only that the oldest file may begin mid-sentence, which is
-cosmetic and only ever affects the oldest audio.
+**Links, not attachments.** A server's upload limit is 10 MB at boost tier 0,
+which is about 20 minutes of mix; a session is hours. The bot runs an aiohttp
+server and hands out
 
-## Export
+    PUBLIC_URL/r/<guild>/<session>/<mix|user id>/<signature>.m4a
 
-**One file per segment**, named by time. Segments separated by less than 2
-minutes are merged into one file — the gap is silence that was never stored, and
-without merging a chatty 12h buffer becomes 50+ attachments.
+The signature is an HMAC over the path, keyed on a hash of the bot token: no
+link database, nothing to guess, and no expiry. A link dies when its session is
+deleted (404). Rotating the token invalidates every link, which is acceptable.
 
-A segment larger than the server's upload limit is split; nothing else is.
-
-Discord's limits are the *server's*, not the uploader's — Nitro does not help a
-bot. 10MB by default, 50MB at boost level 2, 100MB at level 3, 10 attachments
-per message. Read at runtime from `guild.filesize_limit` rather than hardcoded.
+Opening a link flushes the live recorder if the session is live, joins the
+chunks into an `.m4a` (stream copy, `+faststart` so playback starts before the
+download ends) and redirects to an immutable snapshot named after the chunk
+count. Browsers seek with Range requests on the snapshot URL, so a session that
+grows mid-playback does not shift bytes under the player. Snapshots are cached
+in `data/exports` and pruned past 24 h or 1 GiB.
 
 ## Commands
 
 | Command | Behaviour |
 | --- | --- |
-| `/rec get` | the mixed recording |
-| `/rec get-all` | mixed plus every speaker track; confirms first past 10 files |
-| `/rec get-single` | dropdown of who has audio, pick one |
-| `/rec status` | what is being recorded, live RMS, how much is buffered |
-| `/rec list` | the conversations in the buffer |
-| `/rec purge` | delete a channel's buffer (requires Manage Server) |
-| `/rec config` | read or set the silence threshold for a channel |
+| `/record-me` | opt in, announced publicly |
+| `/stop-recording-me` | opt out, announced publicly; past audio rotates out |
+| `/recordings` | ephemeral: latest session, links, a picker for the last 25, Delete for Manage Server |
 
-**No permission gate except on `purge`.** Deliberate: this runs on a small
-private server among friends. On any server where the members are not all
-mutually trusted, `get`/`get-all`/`get-single` should be gated on `view_channel`
-plus `connect` for the target channel, so you can only pull audio from rooms you
-could have walked into.
+**No permission gate on listening.** Deliberate for a small private server: any
+member can open `/recordings`. Deleting a session requires Manage Server and a
+confirmation.
 
-**Names in the dropdown**: keyed by Discord user ID on disk, resolved live to
-`Display Name (@handle)` at render time, falling back to a JSON name cache
-written when a speaker's first chunk lands — otherwise anyone who leaves the
-server shows as a bare number for as long as their audio is buffered.
+**Names**: keyed by Discord user ID on disk, resolved live at render time,
+falling back to a JSON name cache written when a speaker is first heard.
 
 ## Consent
 
-The bot announces when it starts and stops recording in the channel it is
-recording. Recording people without their knowledge is a legal question in many
-jurisdictions, not merely a courtesy; the announcement is on by default and
-turning it off is the operator's decision and responsibility.
+Only people who opted in are recorded, every opt-in and opt-out is public, and
+whenever the bot joins a channel it names who is being recorded in that
+channel's chat, adding anyone who opts in later. Recording people without their
+knowledge is a legal question in many jurisdictions, not merely a courtesy.
 
 ## Implementation notes
 
@@ -174,11 +181,10 @@ so ffmpeg cannot infer the container from the extension. Without the explicit
 flag it exits 234 with "Unable to choose an output format" and every chunk
 silently fails to encode. The same trap previously shipped as a bug with mp3.
 
-**One directory per channel, the track encoded in the filename:**
-`c<start_ms>_d<duration_ms>_s<segment_ms>_t<mix|user_id>.aac`. One glob and one
-regex read the whole buffer. Chunks sharing a `start_ms` form a *group*;
-retention deletes whole groups, so a speaker track can never outlive the mixed
-chunk it belongs to.
+**One directory per session, the track encoded in the filename:**
+`recordings/<guild>/<session_ms>/c<start_ms>_d<duration_ms>_s<segment_ms>_t<mix|user_id>.aac`,
+plus `people.txt` listing who spoke. One glob and one regex read a session;
+retention is one `rmtree`.
 
 **Chunk rotation is synchronised across every open encoder**, so all tracks in a
 group share a start and duration. This is an invariant worth keeping: every
@@ -197,9 +203,10 @@ replaces. Fast path: when the summed peaks of all tracks cannot exceed full
 scale, the mix is a straight `audioop.add` with no limiting work at all.
 
 **Settings live in `settings.json` beside the recordings, not inside them**, so
-`/rec purge` cannot destroy a tuned threshold or the speaker name cache.
+deleting a session cannot lose the opt-in list or the speaker name cache.
 
 **Environment variables changed.** `MP3_BITRATE` became `AUDIO_BITRATE`;
-`RETENTION_SECONDS`, `RETENTION_STRATEGY`, `HIGH_WATER_SLACK` and
-`LOW_WATER_SLACK` are gone; `MAX_DISK_MB`, `LEAVE_GRACE`, `MAX_SPEAKER_TRACKS`
-and `MERGE_GAP_SECONDS` are new. Existing `.env` files need updating.
+`RETENTION_SECONDS`, `RETENTION_STRATEGY`, `HIGH_WATER_SLACK`, `LOW_WATER_SLACK`,
+`MAX_UPLOAD_MB`, `MERGE_GAP_SECONDS` and `AUTOJOIN_DEFAULT` are gone;
+`SESSION_GAP_SECONDS`, `PUBLIC_URL`, `WEB_PORT` and `TIMEZONE` are new.
+`MAX_DISK_MB` now defaults to 10240 and `MAX_SPEAKER_TRACKS` to 6.

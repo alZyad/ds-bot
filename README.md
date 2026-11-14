@@ -1,231 +1,138 @@
-# ds-bot — a Discord voice recording buffer
+# ds-bot — opt-in Discord voice recorder
 
-A Python bot that watches every voice channel of a server, records the
-conversation whenever **two or more people** are in one, keeps a rolling buffer
-of what was said, and hands it back as **playable audio in chat** on demand —
-the mixed conversation, or each person's voice on its own.
+A Python bot that records the voices of people who **asked to be recorded**,
+groups what they said into **sessions**, and serves each session as a
+**private link** that plays in the browser — the whole conversation, or one
+person's voice on its own.
 
 ```
-voice packets (per user, 20 ms)
+/record-me ──▶ settings.json (opt-in, per server)
+                    │
+voice packets ──────┴─▶ only opted-in voices pass
         │
         ▼
    Mixer ─── one mixed mono frame + one frame per speaker, every 20 ms
-        │     (wall-clock anchored, peak-limited mix)
-        ▼
-   Segment state machine ─── opens on speech, closes after 5 s of silence
         │
         ▼
-   Chunks (60 s each) ──▶ ffmpeg ──▶ data/recordings/<guild>/<channel>/*.aac
-        │                            one file per track: mix + each speaker
-        ▼
-   Retention ─── delete the oldest chunk while the buffer exceeds MAX_DISK_MB
+   Segments ─── open on speech, close after 5 s of silence
         │
         ▼
-   /rec get ──▶ join ──▶ remux to .m4a ──▶ upload, one file per conversation
+   Chunks (60 s) ──▶ ffmpeg ──▶ data/recordings/<guild>/<session>/*.aac
+        │
+        ▼
+   Retention ─── delete the oldest session while over MAX_DISK_MB
+        │
+        ▼
+   https://…/r/<guild>/<session>/<track>/<signature>.m4a ──▶ join + remux ──▶ browser
 ```
 
-The full rationale, including the alternatives that were rejected, is in
-[`docs/DESIGN.md`](docs/DESIGN.md).
+Why each piece is the way it is: [`docs/DESIGN.md`](docs/DESIGN.md).
 
 ## Behaviour
 
-| Requirement | How it works |
+| | How it works |
 | --- | --- |
-| Detect how many people are in each audio channel | `on_voice_state_update` plus a 20 s reconciliation sweep count non-bot members of every voice/stage channel. |
-| Record when 2+ people are present | The bot joins the first channel to become eligible and stays there. Threshold is `MIN_SPEAKERS`. Auto-join is **off by default** — an admin turns it on per server with `/rec autojoin enabled:true` (or flip the server-wide default with `AUTOJOIN_DEFAULT`). |
-| Stop on 5 s of silence, resume as soon as someone talks | The silence that follows speech is *buffered*, not written. If someone speaks again within `SILENCE_TIMEOUT` the pause is replayed into the recording (natural rhythm kept); otherwise it is dropped and the segment is closed. The next word opens a new segment on the very next 20 ms frame — there is no restart latency, because the bot never actually leaves the channel. |
-| Keep a bounded buffer, dropping old bits | Audio is written as 60 s chunks. Whenever the total exceeds `MAX_DISK_MB` the oldest chunk is deleted. One rule, no strategies to choose between. |
-| A command to get the recordings in chat | `/rec get` posts the mixed recording, one file per conversation. `/rec get-all` adds every speaker's isolated track; `/rec get-single` gives you a dropdown to pick one person. |
+| Who is recorded | Nobody by default. `/record-me` opts you in for the server, `/stop-recording-me` opts you out. Both answer publicly. Other people's voices never reach the recorder, checked on every packet. |
+| When it joins | A voice channel with **2+ people**, at least one of them opted in. One channel per server, first come first served, no hopping. |
+| What it says | On joining, the voice channel's chat gets "Recording in X: @A, @B. Nobody else in here is recorded." Someone opting in later is announced there once. On leaving, a link to the session. |
+| Silence | Segments close after `SILENCE_TIMEOUT` of silence; dead air is never stored. |
+| Sessions | A session ends once the bot has been out of voice for `SESSION_GAP_SECONDS` (5 min). Rejoining sooner, or moving channel, continues it. |
+| Storage | While the total exceeds `MAX_DISK_MB` (10 GiB), the oldest session is deleted whole. The newest session of a server is never deleted. |
+| Listening | `/recordings` lists sessions with links: everyone, plus each voice. Links never expire; they stop working once the session is deleted. |
+
+## Commands
+
+| Command | What it does |
+| --- | --- |
+| `/record-me` | Opt in: you are recorded whenever you're in a voice channel with someone else. Public. |
+| `/stop-recording-me` | Opt out. What was already recorded stays until it rotates out. Public. |
+| `/recordings` | The latest session: when, how long, who, and links. A picker switches between the last 25 sessions; **Manage Server** also gets *Delete session*. Only you see it. |
+
+## Links
+
+The bot runs a small web server on `WEB_PORT` (8080). A link is
+
+    PUBLIC_URL/r/<guild>/<session>/<mix|user id>/<signature>.m4a
+
+signed with an HMAC keyed on the bot token, so links cannot be guessed and stay
+valid until the session is deleted (or the token changes). Opening one joins the
+session's chunks into an `.m4a` (no re-encode, cached in `data/exports`, pruned
+after 24 h or past 1 GiB) and redirects to that immutable file, so seeking works
+even while the session keeps growing. A live session is flushed first, so the
+last sentence is included.
+
+The bot does not terminate TLS; put it behind a reverse proxy (Caddy:
+`rec.example.org { reverse_proxy dsbot:8080 }`).
 
 ## Requirements
 
-* Python 3.11+
-* `ffmpeg` on `PATH` (does all encoding and remuxing)
-* `libopus` and `libsodium` (installed with `discord.py[voice]` on most
-  platforms; on Debian/Ubuntu: `apt install libopus0 libsodium23`)
-
-In the [Discord developer portal](https://discord.com/developers/applications):
-
-* enable the **Server Members Intent** (needed to see who sits in a voice
-  channel). The message content intent is *not* needed.
-* invite the bot with the scopes `bot` + `applications.commands` and the
-  permissions **View Channels**, **Connect**, **Send Messages**,
-  **Attach Files**.
+* Python 3.11+, `ffmpeg` on `PATH`, `libopus` and `libsodium`
+  (Debian: `apt install ffmpeg libopus0 libsodium23`)
+* In the Discord developer portal: the **Server Members Intent**; invite with
+  scopes `bot` + `applications.commands` and permissions **View Channels**,
+  **Connect**, **Send Messages**.
 
 ## Run it
 
 ```bash
 python -m venv .venv && . .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env      # then put your token in it
+cp .env.example .env      # put your token in it
 python -m dsbot
 ```
 
-Or with Docker (ffmpeg included):
+Or with Docker:
 
 ```bash
 docker build -t ds-bot .
-docker run --rm -e DISCORD_TOKEN=... -v ds-bot-data:/data ds-bot
+docker run -d -e DISCORD_TOKEN=... -e PUBLIC_URL=https://rec.example.org \
+  -v ds-bot-data:/data -p 8080:8080 ds-bot
 ```
 
-Slash commands are synced on startup and may take a minute to appear.
-
-## Commands
-
-| Command | What it does |
-| --- | --- |
-| `/rec help` | What the recorder does and every command, with the current auto-join state. Ephemeral. |
-| `/rec autojoin [enabled]` | Turn automatic recording of busy channels on or off (off by default). Omit `enabled` to read the current state. Requires **Manage Server**. |
-| `/rec get [channel] [minutes]` | The mixed recording, one `.m4a` per conversation. Defaults to the channel you are in and the whole buffer. |
-| `/rec get-all [channel] [minutes]` | The mix plus every speaker's isolated track. Asks for confirmation past 10 files. |
-| `/rec get-single [channel] [minutes]` | A dropdown of who has audio buffered; pick one and get only their voice. |
-| `/rec status` | What is being recorded, the live loudness reading, how much is buffered. Ephemeral. |
-| `/rec list [channel]` | The conversations in the buffer with timestamps and sizes — one file each when exported. Ephemeral. |
-| `/rec config [channel] [silence_rms] [reset]` | Read or set the silence gate for a channel. Ephemeral. |
-| `/rec purge [channel]` | Delete a channel's buffer. Requires **Manage Server**. |
-
-`/rec get*` flushes the in-progress chunk first, so it always includes the
-sentence that just finished.
-
-**There is no permission check on the `get` commands.** That is deliberate for a
-small private server: anyone can pull any channel's audio. If your members are
-not all mutually trusted, gate them on `view_channel` + `connect` for the target
-channel so people can only pull audio from rooms they could have walked into.
-
-## Retention
-
-One rule:
-
-> While the buffer is larger than `MAX_DISK_MB`, delete the oldest chunk.
-
-The buffer is a **ring of small files**, not one big file, which is what makes
-that cheap: expiring audio is an `unlink`, not a rewrite. Chunks sharing a start
-time form a *group* — the mix plus the speaker tracks covering that moment — and
-a group is always deleted whole, so a speaker track can never outlive its mix.
-
-The last remaining group is never deleted, so a budget smaller than one chunk
-degrades to "hold one chunk" rather than to an empty buffer.
-
-The cost of chunk-granularity deletion is that the oldest file may begin
-mid-sentence. That is cosmetic, and it only ever affects the oldest audio.
-Several cleverer schemes were tried on paper first and rejected — a speech-
-duration window, a "never drop below N hours" floor, a segment count cap, and
-whole-segment deletion; [`docs/DESIGN.md`](docs/DESIGN.md#retention) explains
-why each one is worse.
-
-## Storage
-
-Audio is mixed to 48 kHz **mono** and encoded straight into ffmpeg's stdin — raw
-PCM never touches the disk. Chunks are **AAC in an ADTS stream**, remuxed to
-`.m4a` on export.
-
-AAC because it plays in VLC and Windows Media Player alike and is roughly a
-third smaller than mp3 at the same quality. ADTS because it is self-framing, so
-joining chunks is byte concatenation plus one stream-copy remux — nothing is
-re-encoded on the way out.
-
-| | Per hour of talking | 1 GiB budget |
-| --- | --- | --- |
-| 48 kHz stereo PCM (what Discord sends) | 691 MB | 1.5 h |
-| **AAC 64 kbps, mix only** | **29 MB** | **~36 h** |
-| AAC 64 kbps, mix + 6 speaker tracks | 86 MB | ~12 h |
-
-Only *speech* counts: an idle channel costs nothing. Quality is capped upstream
-— Discord encodes each microphone to roughly 64 kbps Opus before it reaches us,
-so spending more bits here preserves detail that is already gone.
-
-## Isolated tracks
-
-**Off by default.** `MAX_SPEAKER_TRACKS` ships as `0`, which records the mix
-only and hides `/rec get-all` and `/rec get-single`. Each isolated track is
-another concurrent ffmpeg process, so this is the knob that decides whether the
-bot fits on a 1 GB host. Set it to `6` to get the behaviour described below.
-
-Alongside the mix, each speaker gets their own file while a conversation has no
-more than `MAX_SPEAKER_TRACKS` distinct speakers. Distinct *speakers*, not
-channel occupants: a track only exists because somebody talked, so a 10-person
-channel where 3 people speak gets 3 tracks.
-
-Alignment is free. The recorder pulls exactly one frame per 20 ms of real time
-and feeds every track from that same pull, so all of them share one
-sample-accurate timeline. A speaker first heard part-way through a chunk gets
-silence back-filled to the chunk start; if the speaker limit is exceeded
-mid-chunk the open tracks are frozen with silence to the end of it. Either way,
-every track in a chunk is exactly as long as that chunk's mix.
-
-When the limit is exceeded, what was already captured is kept and no further
-track is opened for the rest of the conversation. Tracks are reconsidered from
-scratch for the next one. The mix always records everyone regardless.
-
-The mix is peak-limited: adding several voices together can exceed full scale,
-and chopping the peaks off — which is what a plain 16-bit sum does — sounds like
-crackling exactly during the crosstalk you most want to replay. Isolated tracks
-are never summed with anything, so they are always an unlimited copy.
+Slash commands sync on startup; Ctrl/Cmd+R refreshes a Discord client that
+doesn't show them yet.
 
 ## Configuration
 
-Every value is read from the environment (or a `.env` file); see
-[`.env.example`](.env.example) for the full annotated list.
+Environment variables (or `.env`); [`.env.example`](.env.example) is annotated.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `DISCORD_TOKEN` | — | Bot token (required) |
-| `MIN_SPEAKERS` | `2` | People needed before recording starts |
+| `DISCORD_TOKEN` | — | Bot token (required); also keys the link signatures |
+| `PUBLIC_URL` | `http://localhost:8080` | Base of the links handed out |
+| `WEB_PORT` | `8080` | Port of the link server |
+| `TIMEZONE` | `Europe/Paris` | Time zone of the session picker labels and file names |
+| `MIN_SPEAKERS` | `2` | People needed in a channel (one of them opted in) |
 | `SILENCE_TIMEOUT` | `5.0` | Seconds of silence that end a segment |
-| `SILENCE_RMS` | `150` | Default amplitude gate; override per channel with `/rec config` |
-| `LEAVE_GRACE` | `5.0` | Seconds to wait before leaving a channel that emptied |
-| `MAX_DISK_MB` | `1024` | The whole buffer budget, across every channel |
-| `CHUNK_SECONDS` | `60` | Chunk size, i.e. deletion granularity |
-| `MAX_SPEAKER_TRACKS` | `0` | Speakers per conversation before isolated tracks stop; `0` (default) disables them, and hides `/rec get-all` and `/rec get-single` |
+| `SILENCE_RMS` | `150` | Loudness (0..32767) below which audio counts as silence |
+| `LEAVE_GRACE` | `5.0` | Seconds before leaving a channel that stopped qualifying |
+| `SESSION_GAP_SECONDS` | `300` | Time out of voice that ends a session |
+| `MAX_DISK_MB` | `10240` | Recording budget across every server |
+| `CHUNK_SECONDS` | `60` | Chunk length |
+| `MAX_SPEAKER_TRACKS` | `6` | Speakers per conversation before per-voice tracks stop; `0` disables them |
 | `AUDIO_BITRATE` | `64k` | AAC bitrate |
-| `MAX_UPLOAD_MB` | `9.0` | Attachment cap; the guild's real limit wins if lower |
-| `MERGE_GAP_SECONDS` | `120` | Conversations closer than this merge into one export file |
-| `DATA_DIR` | `./data` | Where chunks, settings and temporary exports live |
-| `ANNOUNCE` | `true` | Post a notice in the channel when recording starts/stops |
+| `DATA_DIR` | `./data` | Recordings, exports and `settings.json` |
+| `ANNOUNCE` | `true` | Post the join/leave notices |
 | `INCLUDE_CHANNEL_IDS` / `EXCLUDE_CHANNEL_IDS` | — | Allow / deny lists of voice channel ids |
 
-`SILENCE_RMS` per-channel overrides and the speaker name cache live in
-`DATA_DIR/settings.json`, outside the recordings, so `/rec purge` cannot destroy
-a tuned threshold.
+## Storage
 
-## Design notes
+Mono AAC at 64 kbps is about 29 MB per hour per track. A session records the mix
+plus one track per speaker (up to `MAX_SPEAKER_TRACKS`), so 5 h with 5 people
+talking is roughly 0.9 GB, and 10 GiB holds about a dozen such evenings. Only
+speech counts: silence is never stored.
 
-* **Wall-clock alignment.** The pump asks the mixer for exactly one frame per
-  20 ms of real time, anchored to a monotonic clock, so a busy event loop does
-  not stretch the recording. If it ever falls more than a second behind it
-  re-anchors instead of spinning to catch up, and counts the event.
-* **Bounded memory.** Per-user packet buffers hold 400 ms; a client that floods
-  drops its *oldest* audio rather than growing without limit.
-* **Crash safety.** A chunk being written is a `.part` file, invisible to
-  readers, and becomes visible by an atomic rename once ffmpeg has flushed it.
-  Leftovers from a crash are swept at startup. There is no index to corrupt —
-  all timing metadata lives in the filenames.
-* **One channel per server at a time.** Discord allows a bot one voice
-  connection per guild. The bot follows the *first* channel to become eligible
-  and stays there while it remains so, even if another gets busier — hopping
-  would cut the conversation already being captured. A second busy channel is
-  therefore **not recorded**; to cover several at once, run several bot
-  applications with complementary `INCLUDE_CHANNEL_IDS`.
-* **A blip does not sever the recording.** Dropping below `MIN_SPEAKERS` starts
-  a `LEAVE_GRACE` countdown rather than an immediate disconnect, so a reconnect
-  or a channel move does not split the conversation in two.
-* **Silence is never stored**, so the buffer holds actual talking.
-* **Chunk-boundary padding.** Joining AAC chunks adds about one encoder frame
-  (~27 ms) of padding per boundary, so a long export runs slightly longer than
-  the sum of its chunks — roughly 20 s over a 12 h buffer of 60 s chunks.
-  Audible content is unaffected. A larger `CHUNK_SECONDS` reduces it.
-* **The silence gate is not optional.** `voice-recv` delivers packets whenever a
-  client transmits, so an always-open microphone in a noisy room transmits
-  continuously. Without the RMS gate the 5 s rule would never fire and every
-  session would be one unbroken segment of mostly dead air.
+Per-voice tracks are aligned with the mix chunk by chunk. When a conversation
+passes `MAX_SPEAKER_TRACKS` distinct speakers, the tracks already written are
+kept and no new one opens until the next conversation; the mix always has
+everyone who opted in.
 
 ## Recording people
 
-Recording a conversation is regulated in many places, and Discord's own
-developer policy requires that users know. `ANNOUNCE=true` (the default) posts a
-visible notice in the channel when recording starts and stops, and the bot
-appears in the member list of the voice channel while it records. Keep the
-notice on, tell your members, and check what consent rules apply where you are.
+Recording a conversation is regulated in many places, and Discord's developer
+policy requires that users know. Here nobody is recorded without running
+`/record-me`, every opt-in is public, and the voice channel is told who is being
+recorded whenever the bot joins. Check what consent rules apply where you are.
 
 ## Tests
 
@@ -234,13 +141,5 @@ pip install pytest pytest-asyncio
 python -m pytest
 ```
 
-The suite covers the mixer and limiter, the segment/silence state machine, chunk
-rotation, track alignment and the speaker limit, retention, export splitting and
-segment merging, the settings store, and the "how many people are in this
-channel" logic. It needs no Discord connection, and no ffmpeg either:
-`tests/fake_ffmpeg.py` stands in for the encoder, so the whole pipeline is
-exercised end to end.
-
-`tests/test_ffmpeg_real.py` runs the same path against the actual binary and is
-skipped when ffmpeg is missing — a stub cannot catch a wrong ffmpeg invocation,
-and that has already cost this project one shipped bug.
+No Discord connection and no ffmpeg needed: `tests/fake_ffmpeg.py` stands in for
+the encoder. `tests/test_ffmpeg_real.py` runs the real binary when installed.
