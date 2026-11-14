@@ -95,6 +95,7 @@ class ChannelRecorder:
 
         self._frame_seconds = cfg.frame_ms / 1000
         self._task: asyncio.Task | None = None
+        self._lock = asyncio.Lock()
         self._running = False
         self._last_rms = 0
 
@@ -148,7 +149,8 @@ class ChannelRecorder:
                 await task
             except asyncio.CancelledError:
                 pass
-        await self._close_segment()
+        async with self._lock:
+            await self._close_segment()
         self.mixer.reset()
         if was_running:
             log.info(
@@ -173,7 +175,8 @@ class ChannelRecorder:
                     # Re-anchor instead of spinning to catch up.
                     self.stats.late_resyncs += 1
                     anchor, ticks = time.monotonic(), 0
-                await self._handle_frame()
+                async with self._lock:
+                    await self._handle_frame()
         except asyncio.CancelledError:
             raise
         except Exception:  # pragma: no cover - keep the bot alive
@@ -346,8 +349,9 @@ class ChannelRecorder:
 
     async def flush(self) -> None:
         """Make everything recorded so far visible on disk (used before export)."""
-        if self._chunk_frames > 0:
-            await self._rotate_chunk()
+        async with self._lock:
+            if self._chunk_frames > 0:
+                await self._rotate_chunk()
 
     # -- introspection ------------------------------------------------------
 

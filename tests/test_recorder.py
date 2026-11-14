@@ -280,3 +280,20 @@ async def test_describe_reports_the_buffer(recorder):
     assert info["last_rms"] > 0
     assert info["tracks"] is True
     assert info["session_ms"] == 3
+
+
+async def test_flushing_while_the_pump_runs_loses_nothing(recorder):
+    import asyncio
+    await recorder.start()
+    for _ in range(6):
+        for _ in range(15):
+            recorder.mixer.submit(1, loud())
+        await asyncio.sleep(0.05)
+        await recorder.flush()
+        await asyncio.sleep(0.05)
+    await recorder.stop()
+    session_dir = recorder.store.session_dir(1, 3)
+    assert list(session_dir.glob("*.part")) == []
+    starts = [c.start_ms for c in chunks(recorder)]
+    assert len(starts) == len(set(starts))
+    assert sum(c.duration_ms for c in chunks(recorder)) == recorder.stats.frames_written * 20
