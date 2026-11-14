@@ -20,10 +20,9 @@ import asyncio
 import logging
 import shutil
 from collections.abc import Sequence
-from dataclasses import dataclass
 from pathlib import Path
 
-from .store import Chunk, Segment
+from .store import Chunk
 
 log = logging.getLogger(__name__)
 
@@ -134,46 +133,6 @@ class AudioEncoder:
         return self.destination if self.destination.exists() else None
 
 
-@dataclass(frozen=True)
-class ExportPart:
-    """One file to upload."""
-
-    path: Path
-    start_ms: int
-    end_ms: int
-    duration_ms: int
-    index: int
-    total: int
-
-    @property
-    def size_bytes(self) -> int:
-        try:
-            return self.path.stat().st_size
-        except OSError:  # pragma: no cover
-            return 0
-
-
-def split_for_upload(chunks: Sequence[Chunk], max_bytes: int) -> list[list[Chunk]]:
-    """Group chunks into batches whose concatenation fits an attachment.
-
-    Because every chunk is already a standalone AAC stream we can size the
-    parts from the files themselves instead of guessing at a bitrate.
-    """
-    batches: list[list[Chunk]] = []
-    current: list[Chunk] = []
-    size = 0
-    for chunk in chunks:
-        chunk_size = chunk.size_bytes
-        if current and size + chunk_size > max_bytes:
-            batches.append(current)
-            current, size = [], 0
-        current.append(chunk)
-        size += chunk_size
-    if current:
-        batches.append(current)
-    return batches
-
-
 async def concat(
     chunks: Sequence[Chunk],
     destination: Path,
@@ -213,40 +172,3 @@ async def concat(
     finally:
         joined.unlink(missing_ok=True)
     return destination
-
-
-async def export(
-    segments: Sequence[Segment],
-    workdir: Path,
-    *,
-    prefix: str,
-    max_bytes: int,
-    binary: str = "ffmpeg",
-    bitrate: str = "64k",
-) -> list[ExportPart]:
-    """Build one uploadable file per segment, splitting only oversized ones."""
-    if not segments:
-        return []
-    workdir.mkdir(parents=True, exist_ok=True)
-    parts: list[ExportPart] = []
-    numbered = len(segments) > 1
-    for position, segment in enumerate(segments, start=1):
-        batches = split_for_upload(segment.chunks, max_bytes)
-        stem = f"{prefix}-{position:02d}" if numbered else prefix
-        for index, batch in enumerate(batches, start=1):
-            suffix = "" if len(batches) == 1 else f"-part{index:02d}"
-            destination = workdir / f"{stem}{suffix}{EXPORT_SUFFIX}"
-            await concat(
-                batch, destination, binary=binary, bitrate=bitrate, workdir=workdir
-            )
-            parts.append(
-                ExportPart(
-                    path=destination,
-                    start_ms=batch[0].start_ms,
-                    end_ms=batch[-1].end_ms,
-                    duration_ms=sum(c.duration_ms for c in batch),
-                    index=index,
-                    total=len(batches),
-                )
-            )
-    return parts

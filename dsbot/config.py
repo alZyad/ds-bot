@@ -53,20 +53,14 @@ class Config:
     max_disk_mb: float = 1024.0
     chunk_seconds: float = 60.0
 
-    # per-speaker tracks. The cap doubles as the on/off flag: 0 keeps the mix
-    # only, which is one ffmpeg process instead of one per speaker. That is the
-    # difference between fitting on a 1 GB host and not.
-    max_speaker_tracks: int = 0
+    max_speaker_tracks: int = 6
 
     # output
     audio_bitrate: str = "64k"
     ffmpeg: str = "ffmpeg"
-    max_upload_mb: float = 9.0
-    merge_gap_seconds: float = 120.0
 
     # behaviour
     announce: bool = True
-    autojoin_default: bool = False
     include_channel_ids: frozenset[int] = field(default_factory=frozenset)
     exclude_channel_ids: frozenset[int] = field(default_factory=frozenset)
     log_level: str = "INFO"
@@ -87,13 +81,10 @@ class Config:
             sample_rate=_int("SAMPLE_RATE", 48000),
             max_disk_mb=_float("MAX_DISK_MB", 1024.0),
             chunk_seconds=_float("CHUNK_SECONDS", 60.0),
-            max_speaker_tracks=_int("MAX_SPEAKER_TRACKS", 0),
+            max_speaker_tracks=_int("MAX_SPEAKER_TRACKS", 6),
             audio_bitrate=(os.getenv("AUDIO_BITRATE") or "64k").strip(),
             ffmpeg=(os.getenv("FFMPEG") or "ffmpeg").strip(),
-            max_upload_mb=_float("MAX_UPLOAD_MB", 9.0),
-            merge_gap_seconds=_float("MERGE_GAP_SECONDS", 120.0),
             announce=_bool("ANNOUNCE", True),
-            autojoin_default=_bool("AUTOJOIN_DEFAULT", False),
             include_channel_ids=_ids("INCLUDE_CHANNEL_IDS"),
             exclude_channel_ids=_ids("EXCLUDE_CHANNEL_IDS"),
             log_level=(os.getenv("LOG_LEVEL") or "INFO").strip().upper(),
@@ -110,8 +101,6 @@ class Config:
             raise ValueError("MAX_DISK_MB must be > 0")
         if self.max_speaker_tracks < 0:
             raise ValueError("MAX_SPEAKER_TRACKS must be >= 0")
-        if self.merge_gap_seconds < 0:
-            raise ValueError("MERGE_GAP_SECONDS must be >= 0")
         if not 0 <= self.silence_rms <= 32767:
             raise ValueError("SILENCE_RMS must be between 0 and 32767")
         if self.leave_grace < 0:
@@ -138,10 +127,6 @@ class Config:
     @property
     def max_disk_bytes(self) -> int:
         return int(self.max_disk_mb * 1024 * 1024)
-
-    @property
-    def merge_gap_ms(self) -> int:
-        return int(self.merge_gap_seconds * 1000)
 
     def channel_allowed(self, channel_id: int) -> bool:
         if self.include_channel_ids and channel_id not in self.include_channel_ids:

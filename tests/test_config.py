@@ -8,7 +8,6 @@ def test_derived_values():
     assert cfg.silence_frames == 250   # 5s / 20ms
     assert cfg.chunk_frames == 3000    # 60s / 20ms
     assert cfg.max_disk_bytes == 1024 * 1024 * 1024
-    assert cfg.merge_gap_ms == 120_000
 
 
 @pytest.mark.parametrize("kwargs", [
@@ -16,7 +15,6 @@ def test_derived_values():
     {"chunk_seconds": 0},
     {"max_disk_mb": 0},
     {"max_speaker_tracks": -1},
-    {"merge_gap_seconds": -1},
     {"silence_rms": -1},
     {"silence_rms": 40000},
     {"leave_grace": -1},
@@ -42,7 +40,6 @@ def test_from_env(monkeypatch, tmp_path):
     monkeypatch.setenv("MAX_SPEAKER_TRACKS", "4")
     monkeypatch.setenv("AUDIO_BITRATE", "96k")
     monkeypatch.setenv("LEAVE_GRACE", "7.5")
-    monkeypatch.setenv("MERGE_GAP_SECONDS", "60")
     monkeypatch.setenv("ANNOUNCE", "no")
     monkeypatch.setenv("EXCLUDE_CHANNEL_IDS", "12, 34")
     cfg = Config.from_env()
@@ -52,16 +49,8 @@ def test_from_env(monkeypatch, tmp_path):
     assert cfg.max_speaker_tracks == 4
     assert cfg.audio_bitrate == "96k"
     assert cfg.leave_grace == 7.5
-    assert cfg.merge_gap_seconds == 60
     assert cfg.announce is False
     assert cfg.exclude_channel_ids == frozenset({12, 34})
-
-
-def test_autojoin_default_from_env(monkeypatch):
-    monkeypatch.delenv("AUTOJOIN_DEFAULT", raising=False)
-    assert Config.from_env().autojoin_default is False
-    monkeypatch.setenv("AUTOJOIN_DEFAULT", "true")
-    assert Config.from_env().autojoin_default is True
 
 
 def test_from_env_validates(monkeypatch):

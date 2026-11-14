@@ -22,7 +22,6 @@ def cfg(tmp_path):
         chunk_seconds=0.2,     # 10 frames
         max_disk_mb=1.0,
         max_speaker_tracks=2,
-        merge_gap_seconds=2.0,
         leave_grace=0.05,
         ffmpeg=str(FAKE_FFMPEG),
     )

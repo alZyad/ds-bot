@@ -1,11 +1,6 @@
 """Small JSON side-store for things the operator changes at runtime.
 
-Two kinds of state live here, both deliberately outside the recordings so that
-purging audio never loses them:
-
-*Per-channel overrides* — currently only the silence threshold, which has to be
-tuned against the actual microphones in a channel and therefore cannot be a
-startup-only environment variable.
+Kept deliberately outside the recordings so that deleting audio never loses it.
 
 *A speaker name cache* — the recordings are keyed by Discord user id, which is
 stable but unreadable.  We snapshot a display name the first time somebody's
@@ -29,7 +24,7 @@ class Settings:
 
     def __init__(self, path: Path) -> None:
         self.path = Path(path)
-        self._data: dict[str, Any] = {"channels": {}, "names": {}, "guilds": {}}
+        self._data: dict[str, Any] = {"names": {}, "guilds": {}}
         self.load()
 
     # -- persistence --------------------------------------------------------
@@ -43,7 +38,6 @@ class Settings:
             log.warning("could not read %s, starting from defaults", self.path)
             return
         if isinstance(raw, dict):
-            self._data["channels"] = dict(raw.get("channels") or {})
             self._data["names"] = dict(raw.get("names") or {})
             self._data["guilds"] = dict(raw.get("guilds") or {})
 
@@ -65,28 +59,6 @@ class Settings:
         finally:
             if tmp is not None:
                 tmp.unlink(missing_ok=True)
-
-    # -- per-channel overrides ---------------------------------------------
-
-    def channel_option(self, channel_id: int, key: str, default: Any = None) -> Any:
-        return (self._data["channels"].get(str(channel_id)) or {}).get(key, default)
-
-    def set_channel_option(self, channel_id: int, key: str, value: Any) -> None:
-        bucket = self._data["channels"].setdefault(str(channel_id), {})
-        if value is None:
-            bucket.pop(key, None)
-            if not bucket:
-                self._data["channels"].pop(str(channel_id), None)
-        else:
-            bucket[key] = value
-        self.save()
-
-    def silence_rms(self, channel_id: int, default: int) -> int:
-        value = self.channel_option(channel_id, "silence_rms")
-        return default if value is None else int(value)
-
-    def set_silence_rms(self, channel_id: int, value: int | None) -> None:
-        self.set_channel_option(channel_id, "silence_rms", value)
 
     # -- per-guild overrides -----------------------------------------------
 

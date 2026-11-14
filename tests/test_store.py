@@ -7,7 +7,6 @@ from dsbot.store import (
     Chunk,
     ChunkStore,
     group_segments,
-    merge_segments,
     plan_trim,
 )
 
@@ -61,26 +60,6 @@ def test_group_segments():
     assert [s.segment_ms // MIN for s in segments] == [0, 10]
     assert segments[0].duration_ms == 3 * MIN
     assert segments[1].start_ms // MIN == 10 and segments[1].end_ms // MIN == 12
-
-
-def test_merge_segments_glues_short_gaps_only():
-    def segment(start_min, length=1):
-        chunks = tuple(
-            Chunk((start_min + i) * MIN, start_min * MIN, MIN, MIX_TRACK, Path("x"))
-            for i in range(length)
-        )
-        return group_segments(chunks)[0]
-
-    # 0..1, then 1..2 (touching), then 30..31 (far away)
-    segments = [segment(0), segment(1), segment(30)]
-    merged = merge_segments(segments, gap_ms=2 * MIN)
-    assert len(merged) == 2
-    assert merged[0].duration_ms == 2 * MIN
-    assert merged[1].start_ms // MIN == 30
-    # with no tolerance the touching pair still merges (gap is zero), the rest not
-    assert len(merge_segments(segments, gap_ms=0)) == 2
-    assert len(merge_segments(segments, gap_ms=29 * MIN)) == 1
-    assert merge_segments([], gap_ms=MIN) == []
 
 
 def test_trim_drops_the_oldest_chunks_until_it_fits(store):

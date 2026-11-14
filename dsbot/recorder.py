@@ -81,14 +81,13 @@ class ChannelRecorder:
         *,
         guild_id: int,
         channel_id: int,
-        silence_rms: int | None = None,
         on_speaker: Callable[[int], None] | None = None,
     ) -> None:
         self.cfg = cfg
         self.store = store
         self.guild_id = guild_id
         self.channel_id = channel_id
-        self.silence_rms = cfg.silence_rms if silence_rms is None else silence_rms
+        self.silence_rms = cfg.silence_rms
         self.on_speaker = on_speaker
         self.mixer = Mixer(frame_ms=cfg.frame_ms, sample_rate=cfg.sample_rate)
         self.stats = RecorderStats()

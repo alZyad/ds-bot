@@ -14,8 +14,8 @@ import struct
 
 import pytest
 
-from dsbot.encoder import AudioEncoder, concat, export, ffmpeg_available
-from dsbot.store import MIX_TRACK, ChunkStore, group_segments
+from dsbot.encoder import AudioEncoder, concat, ffmpeg_available
+from dsbot.store import MIX_TRACK, ChunkStore
 
 pytestmark = pytest.mark.skipif(
     not ffmpeg_available(), reason="ffmpeg is not installed"
@@ -86,32 +86,6 @@ async def test_chunks_concatenate_into_a_playable_m4a(tmp_path):
     duration = float(info["format"]["duration"])
     assert 3.0 <= duration < 3.3
     assert not list((tmp_path / "work").glob("*.joined.aac"))
-
-
-async def test_export_writes_one_playable_file_per_segment(tmp_path):
-    store = ChunkStore(tmp_path / "rec", max_bytes=100_000_000)
-    chunks = []
-    for index, segment in ((0, 0), (1, 0), (5, 5000)):
-        start = index * 1000
-        part = store.part_path(1, 2, start, MIX_TRACK)
-        encoder = AudioEncoder(part, sample_rate=SAMPLE_RATE, bitrate="64k")
-        await encoder.start()
-        encoder.write(tone(50))
-        await encoder.close()
-        chunks.append(store.commit(
-            part, start_ms=start, duration_ms=1000, segment_ms=segment,
-            track=MIX_TRACK,
-        ))
-
-    parts = await export(
-        group_segments(chunks), tmp_path / "out", prefix="general",
-        max_bytes=10_000_000,
-    )
-    assert [p.path.name for p in parts] == ["general-01.m4a", "general-02.m4a"]
-    for part in parts:
-        info = await probe(part.path)
-        assert info["streams"][0]["codec_name"] == "aac"
-        assert part.size_bytes > 0
 
 
 async def test_the_output_format_flag_is_load_bearing(tmp_path):

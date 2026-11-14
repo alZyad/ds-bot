@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 
 import pytest
 
-from dsbot.bot import RecordingBot, _count_files, _member_label, _safe_name
+from dsbot.bot import RecordingBot, _member_label
 from dsbot.config import Config
 
 
@@ -56,11 +56,15 @@ class FakeGuild:
         return self.people.get(user_id)
 
 
+def joining(cfg):
+    bot = RecordingBot(cfg)
+    bot.settings.set_autojoin(100, True)
+    return bot
+
+
 @pytest.fixture
 def bot(tmp_path):
-    return RecordingBot(
-        Config(data_dir=tmp_path, min_speakers=2, leave_grace=0.0, autojoin_default=True)
-    )
+    return joining(Config(data_dir=tmp_path, min_speakers=2, leave_grace=0.0))
 
 
 def guild_with(*channels):
@@ -214,9 +218,7 @@ async def test_reconcile_moves_when_the_channel_empties(bot, monkeypatch):
 
 async def test_a_blip_does_not_sever_the_recording(tmp_path, monkeypatch):
     """Someone reseating a headset drops the count to one for a moment."""
-    bot = RecordingBot(
-        Config(data_dir=tmp_path, min_speakers=2, leave_grace=30.0, autojoin_default=True)
-    )
+    bot = joining(Config(data_dir=tmp_path, min_speakers=2, leave_grace=30.0))
     calls = []
     monkeypatch.setattr(bot, "_setup", lambda channel: _record(calls, "setup"))
     monkeypatch.setattr(bot, "_teardown", lambda guild_id, reason: _record(calls, reason))
@@ -237,9 +239,7 @@ async def test_a_blip_does_not_sever_the_recording(tmp_path, monkeypatch):
 
 
 async def test_the_grace_period_does_expire(tmp_path, monkeypatch):
-    bot = RecordingBot(
-        Config(data_dir=tmp_path, min_speakers=2, leave_grace=0.05, autojoin_default=True)
-    )
+    bot = joining(Config(data_dir=tmp_path, min_speakers=2, leave_grace=0.05))
     calls = []
 
     async def teardown(guild_id, reason):
@@ -318,9 +318,7 @@ async def test_autojoin_can_be_turned_on(tmp_path, monkeypatch):
 
 
 async def test_turning_autojoin_off_tears_down_the_recording(tmp_path, monkeypatch):
-    bot = RecordingBot(
-        Config(data_dir=tmp_path, min_speakers=2, autojoin_default=True)
-    )
+    bot = joining(Config(data_dir=tmp_path, min_speakers=2))
     reasons = []
 
     async def teardown(guild_id, reason):
@@ -335,17 +333,6 @@ async def test_turning_autojoin_off_tears_down_the_recording(tmp_path, monkeypat
     bot.settings.set_autojoin(guild.id, False)
     await bot.reconcile(guild)
     assert reasons == ["auto-join disabled"]
-
-
-def test_autojoin_default_is_a_per_guild_override(tmp_path):
-    on = RecordingBot(Config(data_dir=tmp_path, autojoin_default=True))
-    off = RecordingBot(Config(data_dir=tmp_path))
-    assert on.autojoin_enabled(100) is True
-    assert off.autojoin_enabled(100) is False
-
-    off.settings.set_autojoin(100, True)
-    assert off.autojoin_enabled(100) is True
-    assert off.autojoin_enabled(200) is False
 
 
 # -- names ------------------------------------------------------------------
@@ -368,53 +355,3 @@ def test_speaker_labels_survive_the_member_leaving(bot):
 def test_remembering_an_unknown_member_is_a_no_op(bot):
     bot.remember_speaker(FakeGuild(), 12)
     assert bot.settings.name_for(12) is None
-
-
-# -- export helpers ---------------------------------------------------------
-
-def test_upload_limit_honours_both_the_config_and_the_guild(tmp_path):
-    small = RecordingBot(Config(data_dir=tmp_path, max_upload_mb=9.0))
-    assert small.upload_limit(FakeGuild(filesize_limit=26_214_400)) == 9 * 1024 * 1024
-    # a guild with the free-tier 10 MiB limit wins over a larger config value
-    generous = RecordingBot(Config(data_dir=tmp_path, max_upload_mb=100.0))
-    limit = generous.upload_limit(FakeGuild(filesize_limit=10 * 1024 * 1024))
-    assert limit < 10 * 1024 * 1024
-
-
-def test_segments_for_merges_close_conversations(tmp_path):
-    from dsbot.store import MIX_TRACK
-    bot = RecordingBot(Config(data_dir=tmp_path, merge_gap_seconds=120.0))
-    for start, segment in ((0, 0), (60_000, 0), (180_000, 180_000), (10_000_000, 10_000_000)):
-        part = bot.store.part_path(1, 2, start, MIX_TRACK)
-        part.write_bytes(b"x" * 100)
-        bot.store.commit(
-            part, start_ms=start, duration_ms=60_000, segment_ms=segment,
-            track=MIX_TRACK,
-        )
-    # 0-120s and 180-240s are 60s apart, so they merge; the far one stays alone
-    segments = bot.segments_for(1, 2, track=MIX_TRACK, since_ms=None)
-    assert len(segments) == 2
-    assert segments[0].duration_ms == 180_000
-
-
-def test_counting_files_before_encoding_them(tmp_path):
-    from dsbot.store import MIX_TRACK, group_segments
-    bot = RecordingBot(Config(data_dir=tmp_path))
-    chunks = []
-    for i in range(4):
-        part = bot.store.part_path(1, 2, i * 60_000, MIX_TRACK)
-        part.write_bytes(b"x" * 400)
-        chunks.append(bot.store.commit(
-            part, start_ms=i * 60_000, duration_ms=60_000, segment_ms=0,
-            track=MIX_TRACK,
-        ))
-    jobs = [("mixed", group_segments(chunks))]
-    assert _count_files(bot, jobs, max_bytes=10_000) == 1
-    assert _count_files(bot, jobs, max_bytes=1000) == 2
-    assert _count_files(bot, jobs, max_bytes=400) == 4
-
-
-def test_safe_name_sanitises_channel_names():
-    assert _safe_name("général 🎧 / chat") == "général-chat"
-    assert _safe_name("###") == "voice"
-    assert len(_safe_name("x" * 200)) == 48

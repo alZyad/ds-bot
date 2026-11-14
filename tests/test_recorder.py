@@ -97,16 +97,6 @@ async def test_quiet_audio_does_not_count_as_speech(recorder):
     assert chunks(recorder) == []
 
 
-async def test_a_custom_gate_overrides_the_config(cfg):
-    store = ChunkStore(cfg.data_dir / "recordings", max_bytes=cfg.max_disk_bytes)
-    recorder = ChannelRecorder(
-        cfg, store, guild_id=1, channel_id=2, silence_rms=10_000
-    )
-    for _ in range(5):
-        await tick(recorder, speakers=[1], value=6000)  # loud enough by default
-    assert not recorder.recording
-
-
 # -- chunks -----------------------------------------------------------------
 
 async def test_chunks_rotate_while_a_segment_continues(recorder):

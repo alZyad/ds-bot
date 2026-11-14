@@ -122,24 +122,6 @@ def group_segments(chunks: Sequence[Chunk]) -> list[Segment]:
     return [Segment(seg, tuple(items)) for seg, items in sorted(ordered.items())]
 
 
-def merge_segments(segments: Sequence[Segment], gap_ms: int) -> list[Segment]:
-    """Glue segments separated by no more than ``gap_ms`` into one.
-
-    Export emits one file per segment, and a 5 s pause is enough to start a new
-    one, so a chatty evening would otherwise arrive as dozens of attachments.
-    The gap being merged over is silence that was never stored, so nothing is
-    added to the audio — only the file boundary moves.
-    """
-    merged: list[Segment] = []
-    for segment in sorted(segments, key=lambda s: s.start_ms):
-        if merged and segment.start_ms - merged[-1].end_ms <= gap_ms:
-            previous = merged[-1]
-            merged[-1] = Segment(previous.segment_ms, previous.chunks + segment.chunks)
-        else:
-            merged.append(segment)
-    return merged
-
-
 class ChunkStore:
     """Reads, lists and trims the chunk directories."""
 

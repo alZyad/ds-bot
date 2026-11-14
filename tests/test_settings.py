@@ -1,20 +1,6 @@
 from dsbot.settings import Settings
 
 
-def test_channel_overrides_persist(tmp_path):
-    path = tmp_path / "settings.json"
-    first = Settings(path)
-    assert first.silence_rms(7, default=150) == 150
-
-    first.set_silence_rms(7, 320)
-    assert Settings(path).silence_rms(7, default=150) == 320
-    assert Settings(path).silence_rms(8, default=150) == 150
-
-    first.set_silence_rms(7, None)  # back to the default
-    assert Settings(path).silence_rms(7, default=150) == 150
-    assert Settings(path).channel_option(7, "silence_rms") is None
-
-
 def test_autojoin_persists(tmp_path):
     path = tmp_path / "settings.json"
     first = Settings(path)
@@ -46,10 +32,9 @@ def test_a_corrupt_file_falls_back_to_defaults(tmp_path):
     path = tmp_path / "settings.json"
     path.write_text("{not json", encoding="utf-8")
     settings = Settings(path)
-    assert settings.silence_rms(1, default=150) == 150
-    # and it recovers by rewriting the file
-    settings.set_silence_rms(1, 200)
-    assert Settings(path).silence_rms(1, default=150) == 200
+    assert settings.autojoin(1, default=False) is False
+    settings.set_autojoin(1, True)
+    assert Settings(path).autojoin(1, default=False) is True
 
 
 def test_missing_file_is_not_an_error(tmp_path):
