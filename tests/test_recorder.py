@@ -21,7 +21,7 @@ def loud(value=6000):
 @pytest.fixture
 def recorder(cfg):
     store = ChunkStore(cfg.data_dir / "recordings", max_bytes=cfg.max_disk_bytes)
-    return ChannelRecorder(cfg, store, guild_id=1, channel_id=2)
+    return ChannelRecorder(cfg, store, guild_id=1, channel_id=2, session_ms=3)
 
 
 async def tick(recorder, *, speakers=(), value=6000):
@@ -31,7 +31,12 @@ async def tick(recorder, *, speakers=(), value=6000):
 
 
 def chunks(recorder, track=MIX_TRACK):
-    return recorder.store.list_chunks(1, 2, track=track)
+    return recorder.store.list_chunks(1, 3, track=track)
+
+
+def speakers(recorder):
+    session = recorder.store.session(1, 3)
+    return session.speakers if session else []
 
 
 # -- silence and segments ---------------------------------------------------
@@ -129,30 +134,27 @@ async def test_stop_is_idempotent_and_closes_the_open_chunk(recorder):
     assert len(chunks(recorder)) == 1
 
 
-async def test_the_buffer_is_trimmed_to_the_disk_budget(cfg):
-    # Through the fake encoder a 10-frame chunk is 10 * 1920 bytes per track,
-    # and one speaker means two tracks, so a group is 38400 bytes. A 100 KiB
-    # budget therefore holds two groups and no more.
+async def test_old_sessions_are_trimmed_to_the_disk_budget(cfg):
     store = ChunkStore(cfg.data_dir / "recordings", max_bytes=100_000)
-    recorder = ChannelRecorder(cfg, store, guild_id=1, channel_id=2)
-    for _ in range(40):
+    for old in (1, 2):
+        part = store.part_path(1, old, 0, MIX_TRACK)
+        part.write_bytes(b"x" * 20_000)
+        store.commit(part, start_ms=0, duration_ms=1000, segment_ms=0, track=MIX_TRACK)
+    recorder = ChannelRecorder(cfg, store, guild_id=1, channel_id=2, session_ms=3)
+    for _ in range(20):
         await tick(recorder, speakers=[1])
     await recorder.stop()
-    assert store.total_bytes() <= 100_000
-    assert recorder.stats.trimmed_chunks > 0
-    # the mix and the speaker track were trimmed together, never one alone
-    assert len(chunks(recorder)) == len(chunks(recorder, "1"))
+    assert [s.session_ms for s in store.sessions()] == [2, 3]
+    assert recorder.stats.trimmed_sessions == 1
 
 
-async def test_a_group_bigger_than_the_budget_is_still_kept(cfg):
-    """The buffer degrades to holding one group rather than to holding nothing."""
+async def test_the_live_session_is_never_trimmed(cfg):
     store = ChunkStore(cfg.data_dir / "recordings", max_bytes=4000)
-    recorder = ChannelRecorder(cfg, store, guild_id=1, channel_id=2)
+    recorder = ChannelRecorder(cfg, store, guild_id=1, channel_id=2, session_ms=3)
     for _ in range(40):
         await tick(recorder, speakers=[1])
     await recorder.stop()
-    starts = {c.start_ms for c in store.list_chunks(1, 2, track=None)}
-    assert len(starts) == 1
+    assert len(chunks(recorder)) == 4
     assert store.total_bytes() > 4000
 
 
@@ -163,7 +165,7 @@ async def test_each_speaker_gets_an_aligned_track(recorder):
         await tick(recorder, speakers=[1, 2])
     await recorder.stop()
 
-    assert recorder.store.speakers(1, 2) == [1, 2]
+    assert speakers(recorder) == [1, 2]
     mix = chunks(recorder)[0]
     for user_id in (1, 2):
         track = chunks(recorder, str(user_id))[0]
@@ -198,7 +200,7 @@ async def test_too_many_speakers_keeps_the_mix_and_the_partial_tracks(recorder):
 
     assert recorder.stats.tracks_given_up == 1
     assert len(chunks(recorder)) >= 1              # the mix is always kept
-    assert recorder.store.speakers(1, 2) == [1, 2]  # what was captured is kept
+    assert speakers(recorder) == [1, 2]  # what was captured is kept
     assert chunks(recorder, "3") == []              # the newcomer gets no track
 
 
@@ -220,11 +222,11 @@ async def test_crossing_the_limit_mid_chunk_keeps_the_tracks_aligned(recorder):
 
     for chunk in chunks(recorder):
         group = [
-            c for c in recorder.store.list_chunks(1, 2, track=None)
+            c for c in recorder.store.list_chunks(1, 3, track=None)
             if c.start_ms == chunk.start_ms
         ]
         assert {c.duration_ms for c in group} == {chunk.duration_ms}
-    assert recorder.store.speakers(1, 2) == [1, 2]  # the newcomer still gets none
+    assert speakers(recorder) == [1, 2]  # the newcomer still gets none
 
 
 async def test_tracks_are_reconsidered_for_each_conversation(recorder):
@@ -241,12 +243,12 @@ async def test_tracks_can_be_switched_off_entirely(cfg):
     from dataclasses import replace
     cfg = replace(cfg, max_speaker_tracks=0)
     store = ChunkStore(cfg.data_dir / "recordings", max_bytes=cfg.max_disk_bytes)
-    recorder = ChannelRecorder(cfg, store, guild_id=1, channel_id=2)
+    recorder = ChannelRecorder(cfg, store, guild_id=1, channel_id=2, session_ms=3)
     for _ in range(5):
         await tick(recorder, speakers=[1, 2])
     await recorder.stop()
     assert len(chunks(recorder)) == 1
-    assert store.speakers(1, 2) == []
+    assert speakers(recorder) == []
 
 
 async def test_speakers_are_reported_once_each(recorder):
@@ -277,4 +279,4 @@ async def test_describe_reports_the_buffer(recorder):
     assert info["silence_rms"] == 100
     assert info["last_rms"] > 0
     assert info["tracks"] is True
-    assert info["buffered_ms"] > 0
+    assert info["session_ms"] == 3

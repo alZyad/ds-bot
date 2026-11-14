@@ -355,3 +355,39 @@ def test_speaker_labels_survive_the_member_leaving(bot):
 def test_remembering_an_unknown_member_is_a_no_op(bot):
     bot.remember_speaker(FakeGuild(), 12)
     assert bot.settings.name_for(12) is None
+
+
+# -- sessions ---------------------------------------------------------------
+
+def test_a_first_join_opens_a_new_session(bot, monkeypatch):
+    monkeypatch.setattr("dsbot.bot.now_ms", lambda: 1_000_000)
+    assert bot.session_for(100) == 1_000_000
+
+
+def test_rejoining_within_the_gap_continues_the_session(tmp_path, monkeypatch):
+    bot = RecordingBot(Config(data_dir=tmp_path, session_gap_seconds=300))
+    bot._sessions[100] = 5_000
+    bot._left_at[100] = 10_000
+    monkeypatch.setattr("dsbot.bot.now_ms", lambda: 10_000 + 299_000)
+    assert bot.session_for(100) == 5_000
+    monkeypatch.setattr("dsbot.bot.now_ms", lambda: 10_000 + 300_000)
+    assert bot.session_for(100) == 310_000
+
+
+def test_after_a_restart_the_last_chunk_decides(tmp_path, monkeypatch):
+    from dsbot.store import MIX_TRACK
+    bot = RecordingBot(Config(data_dir=tmp_path, session_gap_seconds=300))
+    part = bot.store.part_path(100, 5_000, 5_000, MIX_TRACK)
+    part.write_bytes(b"x")
+    bot.store.commit(part, start_ms=5_000, duration_ms=60_000, segment_ms=5_000, track=MIX_TRACK)
+    monkeypatch.setattr("dsbot.bot.now_ms", lambda: 65_000 + 299_000)
+    assert bot.session_for(100) == 5_000
+    monkeypatch.setattr("dsbot.bot.now_ms", lambda: 65_000 + 300_000)
+    assert bot.session_for(100) == 365_000
+
+
+def test_speakers_are_listed_in_their_session(bot):
+    guild = FakeGuild(people={7: FakeMember(7, name="zyad")})
+    bot.remember_speaker(guild, 7, 5_000)
+    bot.remember_speaker(guild, 8, 5_000)
+    assert bot.store.people(100, 5_000) == [7, 8]

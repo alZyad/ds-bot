@@ -13,8 +13,7 @@ timeout the buffered frames are flushed (so a natural pause is preserved), and
 if nobody does they are dropped (so the recording holds no dead air).
 
 *Chunks* are fixed-size slices of a segment (``chunk_seconds`` of audio) written
-as individual AAC files.  They are the unit of retention: deleting one costs a
-handful of ``unlink`` calls and one minute of the oldest audio.
+as individual AAC files into the directory of the current session.
 
 *Tracks* are the parallel recordings written for each chunk: always ``mix``, and
 one per speaker while the segment has no more than ``max_speaker_tracks`` of
@@ -47,7 +46,7 @@ class RecorderStats:
     frames_written: int = 0
     segments: int = 0
     chunks: int = 0
-    trimmed_chunks: int = 0
+    trimmed_sessions: int = 0
     late_resyncs: int = 0
     tracks_given_up: int = 0
 
@@ -81,12 +80,14 @@ class ChannelRecorder:
         *,
         guild_id: int,
         channel_id: int,
+        session_ms: int,
         on_speaker: Callable[[int], None] | None = None,
     ) -> None:
         self.cfg = cfg
         self.store = store
         self.guild_id = guild_id
         self.channel_id = channel_id
+        self.session_ms = session_ms
         self.silence_rms = cfg.silence_rms
         self.on_speaker = on_speaker
         self.mixer = Mixer(frame_ms=cfg.frame_ms, sample_rate=cfg.sample_rate)
@@ -131,7 +132,6 @@ class ChannelRecorder:
         if self._running:
             return
         self._running = True
-        self.store.ensure_dir(self.guild_id, self.channel_id)
         self._task = asyncio.create_task(
             self._pump(), name=f"recorder-{self.guild_id}-{self.channel_id}"
         )
@@ -235,7 +235,7 @@ class ChannelRecorder:
     async def _open_track(self, name: str) -> _Track:
         """Start writing one track, back-filled to the start of the chunk."""
         part = self.store.part_path(
-            self.guild_id, self.channel_id, self._chunk_start_ms, name
+            self.guild_id, self.session_ms, self._chunk_start_ms, name
         )
         encoder = AudioEncoder(
             part,
@@ -263,8 +263,7 @@ class ChannelRecorder:
         committed = await self._commit_tracks(tracks)
         if committed:
             self.stats.chunks += 1
-            victims = self.store.trim()
-            self.stats.trimmed_chunks += len(victims)
+            self.stats.trimmed_sessions += len(self.store.trim())
         return committed
 
     async def _commit_tracks(self, tracks: dict[str, _Track]) -> list[Chunk]:
@@ -311,7 +310,7 @@ class ChannelRecorder:
         if self.on_speaker is not None:
             for uid in fresh:
                 self.on_speaker(uid)
-        if len(self._segment_speakers) > self.cfg.max_speaker_tracks:
+        if self._tracks_enabled and len(self._segment_speakers) > self.cfg.max_speaker_tracks:
             await self._give_up_tracks()
 
     async def _write_frame(self, frame: MixedFrame) -> None:
@@ -320,8 +319,7 @@ class ChannelRecorder:
         self._tracks[MIX_TRACK].encoder.write(frame.pcm)
         self._tracks[MIX_TRACK].frames += 1
 
-        if self._tracks_enabled:
-            await self._note_speakers(frame.speakers)
+        await self._note_speakers(frame.speakers)
         if self._tracks_enabled:
             for user_id in frame.speakers:
                 if str(user_id) not in self._tracks:
@@ -357,15 +355,15 @@ class ChannelRecorder:
         return {
             "guild_id": self.guild_id,
             "channel_id": self.channel_id,
+            "session_ms": self.session_ms,
             "running": self._running,
             "in_segment": self.recording,
             "silence_rms": self.silence_rms,
             "last_rms": self._last_rms,
-            "buffered_ms": self.store.total_duration_ms(self.guild_id, self.channel_id),
             "segments": self.stats.segments,
             "chunks": self.stats.chunks,
             "recorded_seconds": round(self.stats.recorded_seconds, 1),
-            "trimmed_chunks": self.stats.trimmed_chunks,
+            "trimmed_sessions": self.stats.trimmed_sessions,
             "speakers": sorted(self._segment_speakers),
             "tracks": self._tracks_enabled,
             "limited_frames": self.mixer.limiter.limited_frames,

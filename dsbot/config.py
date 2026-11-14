@@ -49,9 +49,9 @@ class Config:
     frame_ms: int = 20
     sample_rate: int = 48000
 
-    # rolling buffer: one disk budget, trimmed oldest chunk first
-    max_disk_mb: float = 1024.0
+    max_disk_mb: float = 10240.0
     chunk_seconds: float = 60.0
+    session_gap_seconds: float = 300.0
 
     max_speaker_tracks: int = 6
 
@@ -79,8 +79,9 @@ class Config:
             leave_grace=_float("LEAVE_GRACE", 5.0),
             frame_ms=_int("FRAME_MS", 20),
             sample_rate=_int("SAMPLE_RATE", 48000),
-            max_disk_mb=_float("MAX_DISK_MB", 1024.0),
+            max_disk_mb=_float("MAX_DISK_MB", 10240.0),
             chunk_seconds=_float("CHUNK_SECONDS", 60.0),
+            session_gap_seconds=_float("SESSION_GAP_SECONDS", 300.0),
             max_speaker_tracks=_int("MAX_SPEAKER_TRACKS", 6),
             audio_bitrate=(os.getenv("AUDIO_BITRATE") or "64k").strip(),
             ffmpeg=(os.getenv("FFMPEG") or "ffmpeg").strip(),
@@ -105,6 +106,8 @@ class Config:
             raise ValueError("SILENCE_RMS must be between 0 and 32767")
         if self.leave_grace < 0:
             raise ValueError("LEAVE_GRACE must be >= 0")
+        if self.session_gap_seconds < 0:
+            raise ValueError("SESSION_GAP_SECONDS must be >= 0")
         if self.frame_ms not in (10, 20, 40, 60):
             raise ValueError("FRAME_MS must be one of 10, 20, 40, 60")
 
@@ -127,6 +130,10 @@ class Config:
     @property
     def max_disk_bytes(self) -> int:
         return int(self.max_disk_mb * 1024 * 1024)
+
+    @property
+    def session_gap_ms(self) -> int:
+        return int(self.session_gap_seconds * 1000)
 
     def channel_allowed(self, channel_id: int) -> bool:
         if self.include_channel_ids and channel_id not in self.include_channel_ids:

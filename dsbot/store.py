@@ -1,10 +1,12 @@
-"""On-disk ring buffer of AAC chunks, one directory per voice channel.
+"""On-disk store of AAC chunks, one directory per recording session.
 
 Everything needed to reason about a recording lives in the file *name*, so the
 store survives restarts and crashes with no index to rebuild or corrupt:
 
-    data/recordings/<guild_id>/<channel_id>/c<start>_d<duration>_s<segment>_t<track>.aac
+    data/recordings/<guild_id>/<session_ms>/c<start>_d<duration>_s<segment>_t<track>.aac
+    data/recordings/<guild_id>/<session_ms>/people.txt
 
+* ``session_ms`` wall-clock start of the session (unix epoch, ms)
 * ``start``     wall-clock start of the chunk (unix epoch, ms)
 * ``duration``  how much audio the chunk actually contains, in ms
 * ``segment``   identifies the continuous conversation the chunk belongs to.
@@ -13,9 +15,7 @@ store survives restarts and crashes with no index to rebuild or corrupt:
 * ``track``     ``mix`` for the mixed recording, or a Discord user id for one
   speaker's isolated track.
 
-Chunks sharing a ``start`` form a *group*: the mixed chunk and the per-speaker
-chunks covering the same moment.  Retention deletes whole groups, so a speaker
-track can never outlive the mix it belongs to.
+Retention deletes whole sessions, oldest first.
 
 Files still being written carry a ``.part`` suffix and are ignored by readers,
 so a chunk becomes visible atomically when it is renamed into place.
@@ -25,9 +25,11 @@ from __future__ import annotations
 
 import logging
 import re
+import shutil
 import time
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable
 from dataclasses import dataclass
+from functools import cached_property
 from pathlib import Path
 
 log = logging.getLogger(__name__)
@@ -38,6 +40,7 @@ CHUNK_RE = re.compile(
     r"^c(?P<start>\d+)_d(?P<dur>\d+)_s(?P<seg>\d+)_t(?P<track>mix|\d+)\.aac$"
 )
 CHUNK_GLOB = f"c*{CHUNK_SUFFIX}"
+PEOPLE_FILE = "people.txt"
 
 
 def now_ms() -> int:
@@ -92,129 +95,107 @@ class Chunk:
 
 
 @dataclass(frozen=True)
-class Segment:
-    """A contiguous conversation, i.e. a group of chunks of one track."""
-
-    segment_ms: int
+class Session:
+    guild_id: int
+    session_ms: int
+    path: Path
     chunks: tuple[Chunk, ...]
 
     @property
-    def duration_ms(self) -> int:
-        return sum(c.duration_ms for c in self.chunks)
+    def mix(self) -> list[Chunk]:
+        return [c for c in self.chunks if c.is_mix]
 
     @property
     def start_ms(self) -> int:
-        return self.chunks[0].start_ms
+        return self.session_ms
 
     @property
     def end_ms(self) -> int:
-        return self.chunks[-1].end_ms
+        return max((c.end_ms for c in self.chunks), default=self.session_ms)
 
     @property
+    def duration_ms(self) -> int:
+        return sum(c.duration_ms for c in self.mix)
+
+    @cached_property
     def size_bytes(self) -> int:
         return sum(c.size_bytes for c in self.chunks)
 
-
-def group_segments(chunks: Sequence[Chunk]) -> list[Segment]:
-    ordered: dict[int, list[Chunk]] = {}
-    for chunk in sorted(chunks):
-        ordered.setdefault(chunk.segment_ms, []).append(chunk)
-    return [Segment(seg, tuple(items)) for seg, items in sorted(ordered.items())]
+    @property
+    def speakers(self) -> list[int]:
+        return sorted({c.user_id for c in self.chunks if c.user_id is not None})
 
 
 class ChunkStore:
-    """Reads, lists and trims the chunk directories."""
-
     def __init__(self, root: Path, *, max_bytes: int) -> None:
         self.root = Path(root)
         self.max_bytes = max_bytes
 
-    # -- layout -------------------------------------------------------------
+    def session_dir(self, guild_id: int, session_ms: int) -> Path:
+        return self.root / str(guild_id) / str(session_ms)
 
-    def channel_dir(self, guild_id: int, channel_id: int) -> Path:
-        return self.root / str(guild_id) / str(channel_id)
-
-    def ensure_dir(self, guild_id: int, channel_id: int) -> Path:
-        path = self.channel_dir(guild_id, channel_id)
-        path.mkdir(parents=True, exist_ok=True)
-        return path
-
-    def known_channels(self) -> list[tuple[int, int]]:
-        out: list[tuple[int, int]] = []
+    def _session_dirs(self, guild_id: int | None = None) -> list[tuple[int, int, Path]]:
         if not self.root.is_dir():
-            return out
-        for guild_dir in self.root.iterdir():
+            return []
+        guild_dirs = (
+            [self.root / str(guild_id)] if guild_id is not None else self.root.iterdir()
+        )
+        out = []
+        for guild_dir in guild_dirs:
             if not guild_dir.is_dir() or not guild_dir.name.isdigit():
                 continue
-            for channel_dir in guild_dir.iterdir():
-                if channel_dir.is_dir() and channel_dir.name.isdigit():
-                    out.append((int(guild_dir.name), int(channel_dir.name)))
-        return sorted(out)
-
-    # -- reading ------------------------------------------------------------
+            for path in guild_dir.iterdir():
+                if path.is_dir() and path.name.isdigit():
+                    out.append((int(guild_dir.name), int(path.name), path))
+        return sorted(out, key=lambda item: (item[1], item[0]))
 
     def list_chunks(
-        self,
-        guild_id: int,
-        channel_id: int,
-        *,
-        track: str | None = MIX_TRACK,
-        since_ms: int | None = None,
-        until_ms: int | None = None,
+        self, guild_id: int, session_ms: int, *, track: str | None = MIX_TRACK
     ) -> list[Chunk]:
-        """Chunks of one channel. ``track=None`` returns every track."""
-        directory = self.channel_dir(guild_id, channel_id)
-        if not directory.is_dir():
+        return _chunks_in(self.session_dir(guild_id, session_ms), track)
+
+    def sessions(self, guild_id: int | None = None) -> list[Session]:
+        return [
+            Session(gid, sid, path, tuple(_chunks_in(path, None)))
+            for gid, sid, path in self._session_dirs(guild_id)
+        ]
+
+    def session(self, guild_id: int, session_ms: int) -> Session | None:
+        path = self.session_dir(guild_id, session_ms)
+        if not path.is_dir():
+            return None
+        return Session(guild_id, session_ms, path, tuple(_chunks_in(path, None)))
+
+    def latest_session(self, guild_id: int) -> Session | None:
+        dirs = self._session_dirs(guild_id)
+        if not dirs:
+            return None
+        gid, sid, path = dirs[-1]
+        return Session(gid, sid, path, tuple(_chunks_in(path, None)))
+
+    def total_bytes(self) -> int:
+        return sum(s.size_bytes for s in self.sessions())
+
+    def people(self, guild_id: int, session_ms: int) -> list[int]:
+        try:
+            raw = (self.session_dir(guild_id, session_ms) / PEOPLE_FILE).read_text()
+        except OSError:
             return []
-        chunks: list[Chunk] = []
-        for path in directory.glob(CHUNK_GLOB):
-            chunk = Chunk.parse(path)
-            if chunk is None:
-                continue
-            if track is not None and chunk.track != track:
-                continue
-            if since_ms is not None and chunk.end_ms <= since_ms:
-                continue
-            if until_ms is not None and chunk.start_ms >= until_ms:
-                continue
-            chunks.append(chunk)
-        return sorted(chunks)
+        return list(dict.fromkeys(int(line) for line in raw.split() if line.isdigit()))
 
-    def all_chunks(self) -> list[Chunk]:
-        """Every chunk of every track in every channel, oldest first."""
-        chunks: list[Chunk] = []
-        for guild_id, channel_id in self.known_channels():
-            chunks.extend(self.list_chunks(guild_id, channel_id, track=None))
-        return sorted(chunks)
-
-    def speakers(self, guild_id: int, channel_id: int) -> list[int]:
-        """User ids that have an isolated track buffered for this channel."""
-        seen = {
-            chunk.user_id
-            for chunk in self.list_chunks(guild_id, channel_id, track=None)
-            if not chunk.is_mix
-        }
-        return sorted(uid for uid in seen if uid is not None)
-
-    def total_duration_ms(self, guild_id: int, channel_id: int) -> int:
-        return sum(c.duration_ms for c in self.list_chunks(guild_id, channel_id))
-
-    def total_bytes(self, guild_id: int | None = None, channel_id: int | None = None) -> int:
-        if guild_id is None or channel_id is None:
-            return sum(c.size_bytes for c in self.all_chunks())
-        return sum(
-            c.size_bytes for c in self.list_chunks(guild_id, channel_id, track=None)
-        )
-
-    def segments(self, guild_id: int, channel_id: int, **kw) -> list[Segment]:
-        return group_segments(self.list_chunks(guild_id, channel_id, **kw))
-
-    # -- writing ------------------------------------------------------------
+    def add_person(self, guild_id: int, session_ms: int, user_id: int) -> None:
+        if user_id in self.people(guild_id, session_ms):
+            return
+        directory = self.session_dir(guild_id, session_ms)
+        directory.mkdir(parents=True, exist_ok=True)
+        with (directory / PEOPLE_FILE).open("a") as handle:
+            handle.write(f"{user_id}\n")
 
     def part_path(
-        self, guild_id: int, channel_id: int, chunk_start_ms: int, track: str
+        self, guild_id: int, session_ms: int, chunk_start_ms: int, track: str
     ) -> Path:
-        directory = self.ensure_dir(guild_id, channel_id)
+        directory = self.session_dir(guild_id, session_ms)
+        directory.mkdir(parents=True, exist_ok=True)
         return directory / f"c{chunk_start_ms}_t{track}.part"
 
     def commit(
@@ -234,74 +215,50 @@ class ChunkStore:
         part.replace(final)
         return Chunk(start_ms, segment_ms, duration_ms, track, final)
 
-    # -- retention ----------------------------------------------------------
+    def delete_session(self, guild_id: int, session_ms: int) -> bool:
+        path = self.session_dir(guild_id, session_ms)
+        if not path.is_dir():
+            return False
+        shutil.rmtree(path, ignore_errors=True)
+        return True
 
-    def trim(self) -> list[Chunk]:
-        """Enforce the disk budget across the whole store. Returns what went."""
-        victims = plan_trim(self.all_chunks(), max_bytes=self.max_bytes)
-        for chunk in victims:
-            try:
-                chunk.path.unlink(missing_ok=True)
-            except OSError:  # pragma: no cover - unlikely, keep the loop alive
-                log.warning("could not delete %s", chunk.path, exc_info=True)
-        if victims:
-            freed = sum(c.size_bytes for c in victims)
+    def trim(self) -> list[Session]:
+        victims = plan_trim(self.sessions(), max_bytes=self.max_bytes)
+        for session in victims:
+            shutil.rmtree(session.path, ignore_errors=True)
             log.info(
-                "trimmed %d file(s) (%.1f MiB) to stay under %.0f MiB",
-                len(victims), freed / 1048576, self.max_bytes / 1048576,
+                "deleted session %s of guild %s (%.1f MiB) to stay under %.0f MiB",
+                session.session_ms, session.guild_id,
+                session.size_bytes / 1048576, self.max_bytes / 1048576,
             )
         return victims
 
-    def purge(self, guild_id: int, channel_id: int) -> int:
-        directory = self.channel_dir(guild_id, channel_id)
+    def cleanup_parts(self) -> int:
         removed = 0
-        if not directory.is_dir():
-            return 0
-        for path in list(directory.glob(CHUNK_GLOB)) + list(directory.glob("*.part")):
-            try:
-                path.unlink()
+        for _, _, path in self._session_dirs():
+            for part in path.glob("*.part"):
+                part.unlink(missing_ok=True)
                 removed += 1
-            except OSError:  # pragma: no cover
-                log.warning("could not delete %s", path, exc_info=True)
-        return removed
-
-    def cleanup_parts(self, older_than_ms: int = 0) -> int:
-        """Delete leftover ``.part`` files from a previous, crashed run."""
-        removed = 0
-        cutoff = now_ms() - older_than_ms
-        for guild_id, channel_id in self.known_channels():
-            for path in self.channel_dir(guild_id, channel_id).glob("*.part"):
-                try:
-                    if older_than_ms <= 0 or int(path.stat().st_mtime * 1000) <= cutoff:
-                        path.unlink()
-                        removed += 1
-                except OSError:  # pragma: no cover
-                    pass
         return removed
 
 
-def plan_trim(chunks: Iterable[Chunk], *, max_bytes: int) -> list[Chunk]:
-    """Decide which chunks to drop. Pure function, so it is easy to test.
+def _chunks_in(directory: Path, track: str | None) -> list[Chunk]:
+    if not directory.is_dir():
+        return []
+    chunks = (Chunk.parse(path) for path in directory.glob(CHUNK_GLOB))
+    return sorted(c for c in chunks if c is not None and (track is None or c.track == track))
 
-    One rule: while the store is over budget, drop the oldest *group* — the
-    mixed chunk for a moment plus every speaker track covering it.  Deleting a
-    group costs a handful of ``unlink`` calls and one minute of the oldest
-    audio, and it can never leave a speaker track orphaned from its mix.
 
-    The last remaining group is always kept, so a budget smaller than a single
-    chunk degrades to "hold one chunk" rather than to an empty buffer.
-    """
-    groups: dict[tuple[Path, int], list[Chunk]] = {}
-    for chunk in chunks:
-        groups.setdefault((chunk.path.parent, chunk.start_ms), []).append(chunk)
-
-    ordered = sorted(groups.items(), key=lambda item: (item[0][1], str(item[0][0])))
-    total = sum(c.size_bytes for group in groups.values() for c in group)
-
-    victims: list[Chunk] = []
-    for _, group in ordered[:-1]:  # never empty the buffer completely
+def plan_trim(sessions: Iterable[Session], *, max_bytes: int) -> list[Session]:
+    ordered = sorted(sessions, key=lambda s: (s.session_ms, s.guild_id))
+    newest = {s.guild_id: s for s in ordered}
+    total = sum(s.size_bytes for s in ordered)
+    victims: list[Session] = []
+    for session in ordered:
         if total <= max_bytes:
             break
-        victims.extend(sorted(group))
-        total -= sum(c.size_bytes for c in group)
+        if newest[session.guild_id] is session:
+            continue
+        victims.append(session)
+        total -= session.size_bytes
     return victims

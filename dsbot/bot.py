@@ -13,10 +13,10 @@ from discord.ext import commands, tasks, voice_recv
 
 from .config import Config
 from .encoder import ffmpeg_available
-from .format import human_duration, human_size
+from .format import human_duration
 from .recorder import ChannelRecorder
 from .settings import Settings
-from .store import ChunkStore
+from .store import ChunkStore, now_ms
 
 log = logging.getLogger(__name__)
 
@@ -43,6 +43,8 @@ class RecordingBot(commands.Bot):
         self._eligible_since: dict[int, float] = {}  # channel_id -> monotonic
         self._leave_since: dict[int, float] = {}  # guild_id -> monotonic
         self._leave_tasks: dict[int, asyncio.Task] = {}
+        self._sessions: dict[int, int] = {}
+        self._left_at: dict[int, int] = {}
 
     # -- setup --------------------------------------------------------------
 
@@ -209,6 +211,18 @@ class RecordingBot(commands.Bot):
 
             await self._setup(eligible[0])
 
+    def session_for(self, guild_id: int) -> int:
+        now = now_ms()
+        current = self._sessions.get(guild_id)
+        left = self._left_at.get(guild_id)
+        if current is not None and left is not None and now - left < self.cfg.session_gap_ms:
+            return current
+        if current is None:
+            latest = self.store.latest_session(guild_id)
+            if latest is not None and now - latest.end_ms < self.cfg.session_gap_ms:
+                return latest.session_ms
+        return now
+
     async def _setup(self, channel) -> None:
         guild = channel.guild
         try:
@@ -223,12 +237,16 @@ class RecordingBot(commands.Bot):
             log.exception("could not join %s", channel)
             return
 
+        session_ms = self.session_for(guild.id)
+        self._sessions[guild.id] = session_ms
+        self._left_at.pop(guild.id, None)
         recorder = ChannelRecorder(
             self.cfg,
             self.store,
             guild_id=guild.id,
             channel_id=channel.id,
-            on_speaker=lambda uid: self.remember_speaker(guild, uid),
+            session_ms=session_ms,
+            on_speaker=lambda uid: self.remember_speaker(guild, uid, session_ms),
         )
         self.recorders[guild.id] = recorder
         self._cancel_grace(guild.id)
@@ -249,7 +267,7 @@ class RecordingBot(commands.Bot):
         await self._announce(
             channel,
             f"🔴 Recording **{channel.name}** — {len(self.humans_in(channel))} people "
-            f"connected. Buffer: up to {human_size(self.cfg.max_disk_bytes)} of audio.",
+            f"connected.",
         )
 
     async def _teardown(self, guild_id: int, *, reason: str) -> None:
@@ -264,13 +282,15 @@ class RecordingBot(commands.Bot):
                 await voice.disconnect(force=True)
         if recorder is not None:
             await recorder.stop()
+            self._left_at[guild_id] = now_ms()
             channel = guild.get_channel(recorder.channel_id) if guild else None
+            session = self.store.session(guild_id, recorder.session_ms)
+            duration = session.duration_ms if session is not None else 0
             if channel is not None:
                 await self._announce(
                     channel,
                     f"⏹️ Stopped recording **{channel.name}** ({reason}). "
-                    f"{human_duration(self.store.total_duration_ms(guild_id, channel.id))}"
-                    f" of audio is buffered.",
+                    f"This session: {human_duration(duration)} of speech.",
                 )
         log.info("torn down guild %s: %s", guild_id, reason)
 
@@ -287,8 +307,12 @@ class RecordingBot(commands.Bot):
 
     # -- speaker names ------------------------------------------------------
 
-    def remember_speaker(self, guild: discord.Guild, user_id: int) -> None:
+    def remember_speaker(
+        self, guild: discord.Guild, user_id: int, session_ms: int | None = None
+    ) -> None:
         """Snapshot a display name so it survives the member leaving."""
+        if session_ms is not None:
+            self.store.add_person(guild.id, session_ms, user_id)
         member = guild.get_member(user_id)
         if member is None:
             return
