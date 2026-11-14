@@ -1,18 +1,22 @@
 from dsbot.settings import Settings
 
 
-def test_autojoin_persists(tmp_path):
+def test_opt_in_persists_per_server(tmp_path):
     path = tmp_path / "settings.json"
     first = Settings(path)
-    assert first.autojoin(100, default=False) is False
-    assert first.autojoin(100, default=True) is True
+    assert first.opted_in(100) == []
 
-    first.set_autojoin(100, True)
-    assert Settings(path).autojoin(100, default=False) is True
+    assert first.set_opted_in(100, 7, True) is True
+    assert first.set_opted_in(100, 7, True) is False
+    first.set_opted_in(100, 8, True)
+    assert Settings(path).opted_in(100) == [7, 8]
+    assert Settings(path).is_opted_in(100, 7)
+    assert not Settings(path).is_opted_in(200, 7)
 
-    first.set_autojoin(100, None)
-    assert Settings(path).autojoin(100, default=False) is False
-    assert Settings(path).guild_option(100, "autojoin") is None
+    first.set_opted_in(100, 7, False)
+    first.set_opted_in(100, 8, False)
+    assert Settings(path).opted_in(100) == []
+    assert Settings(path).guild_option(100, "opted_in") is None
 
 
 def test_names_survive_a_restart(tmp_path):
@@ -32,9 +36,9 @@ def test_a_corrupt_file_falls_back_to_defaults(tmp_path):
     path = tmp_path / "settings.json"
     path.write_text("{not json", encoding="utf-8")
     settings = Settings(path)
-    assert settings.autojoin(1, default=False) is False
-    settings.set_autojoin(1, True)
-    assert Settings(path).autojoin(1, default=False) is True
+    assert settings.opted_in(1) == []
+    settings.set_opted_in(1, 5, True)
+    assert Settings(path).opted_in(1) == [5]
 
 
 def test_missing_file_is_not_an_error(tmp_path):

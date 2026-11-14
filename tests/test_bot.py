@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 
 import pytest
 
-from dsbot.bot import RecordingBot, _member_label
+from dsbot.bot import RecordingBot, _member_label, record_me, stop_recording_me
 from dsbot.config import Config
 
 
@@ -30,10 +30,14 @@ class FakeChannel:
     name: str = "voice"
     members: list = field(default_factory=list)
     guild: object = None
+    sent: list = field(default_factory=list)
 
     @property
     def mention(self):
         return f"<#{self.id}>"
+
+    async def send(self, message, **kwargs):
+        self.sent.append(message)
 
 
 @dataclass
@@ -58,7 +62,8 @@ class FakeGuild:
 
 def joining(cfg):
     bot = RecordingBot(cfg)
-    bot.settings.set_autojoin(100, True)
+    for user_id in range(1, 21):
+        bot.settings.set_opted_in(100, user_id, True)
     return bot
 
 
@@ -154,17 +159,17 @@ def test_allow_and_deny_lists_are_respected(tmp_path):
     other = FakeChannel(2, members=[FakeMember(3), FakeMember(4)])
     guild = guild_with(channel, other)
 
-    denied = RecordingBot(Config(data_dir=tmp_path, exclude_channel_ids=frozenset({1})))
+    denied = joining(Config(data_dir=tmp_path, exclude_channel_ids=frozenset({1})))
     assert denied.eligible_channels(guild) == [other]
 
-    allowed = RecordingBot(Config(data_dir=tmp_path, include_channel_ids=frozenset({1})))
+    allowed = joining(Config(data_dir=tmp_path, include_channel_ids=frozenset({1})))
     assert allowed.eligible_channels(guild) == [channel]
 
 
 def test_min_speakers_is_configurable(tmp_path):
     channel = FakeChannel(1, members=[FakeMember(1)])
     guild = guild_with(channel)
-    solo = RecordingBot(Config(data_dir=tmp_path, min_speakers=1))
+    solo = joining(Config(data_dir=tmp_path, min_speakers=1))
     assert solo.eligible_channels(guild) == [channel]
 
 
@@ -213,7 +218,7 @@ async def test_reconcile_moves_when_the_channel_empties(bot, monkeypatch):
     connected(guild, 1, bot)
 
     await bot.reconcile(guild)  # leave_grace is 0 in this fixture
-    assert calls == [("teardown", "channel no longer eligible"), ("setup", 2)]
+    assert calls == [("teardown", "fewer than 2 people"), ("setup", 2)]
 
 
 async def test_a_blip_does_not_sever_the_recording(tmp_path, monkeypatch):
@@ -257,7 +262,7 @@ async def test_the_grace_period_does_expire(tmp_path, monkeypatch):
     await bot.reconcile(guild)
     assert calls == []                    # inside the grace window
     await asyncio.sleep(0.15)             # the scheduled re-check fires
-    assert calls == ["channel no longer eligible"]
+    assert calls == ["fewer than 2 people"]
 
 
 async def test_reconcile_leaves_when_nothing_is_eligible(bot, monkeypatch):
@@ -271,7 +276,7 @@ async def test_reconcile_leaves_when_nothing_is_eligible(bot, monkeypatch):
     guild = guild_with(FakeChannel(1, members=[FakeMember(1)]))
     guild.voice_client = object()
     await bot.reconcile(guild)
-    assert calls == ["no eligible channel"]
+    assert calls == ["nothing to record"]
 
 
 async def test_reconcile_recovers_from_a_lost_connection(bot, monkeypatch):
@@ -292,47 +297,144 @@ async def test_reconcile_recovers_from_a_lost_connection(bot, monkeypatch):
     assert calls == [("teardown", "connection lost"), ("setup", 1)]
 
 
-# -- auto-join toggle -------------------------------------------------------
+# -- opt-in -----------------------------------------------------------------
 
-async def test_autojoin_is_off_by_default(tmp_path, monkeypatch):
-    bot = RecordingBot(Config(data_dir=tmp_path, min_speakers=2))
-    calls = []
-    monkeypatch.setattr(bot, "_setup", lambda channel: _record(calls, channel))
+def test_nobody_is_recorded_by_default(tmp_path):
+    bot = RecordingBot(Config(data_dir=tmp_path))
+    channel = FakeChannel(1, members=[FakeMember(1), FakeMember(2)])
+    assert bot.eligible_channels(guild_with(channel)) == []
+
+
+def test_one_opted_in_person_among_two_is_enough(tmp_path):
+    bot = RecordingBot(Config(data_dir=tmp_path))
+    bot.settings.set_opted_in(100, 2, True)
     channel = FakeChannel(1, members=[FakeMember(1), FakeMember(2)])
     guild = guild_with(channel)
-
-    await bot.reconcile(guild)
-    assert calls == []
-
-
-async def test_autojoin_can_be_turned_on(tmp_path, monkeypatch):
-    bot = RecordingBot(Config(data_dir=tmp_path, min_speakers=2))
-    started = []
-    monkeypatch.setattr(bot, "_setup", lambda channel: _record(started, channel))
-    channel = FakeChannel(1, members=[FakeMember(1), FakeMember(2)])
-    guild = guild_with(channel)
-
-    bot.settings.set_autojoin(guild.id, True)
-    await bot.reconcile(guild)
-    assert started == [channel]
+    assert bot.eligible_channels(guild) == [channel]
+    assert [m.id for m in bot.recorded_in(channel)] == [2]
 
 
-async def test_turning_autojoin_off_tears_down_the_recording(tmp_path, monkeypatch):
-    bot = joining(Config(data_dir=tmp_path, min_speakers=2))
+def test_an_opted_in_person_alone_is_not_recorded(tmp_path):
+    bot = RecordingBot(Config(data_dir=tmp_path))
+    bot.settings.set_opted_in(100, 1, True)
+    channel = FakeChannel(1, members=[FakeMember(1)])
+    assert bot.eligible_channels(guild_with(channel)) == []
+
+
+def test_only_opted_in_voices_reach_the_recorder(tmp_path):
+    bot = RecordingBot(Config(data_dir=tmp_path))
+    bot.settings.set_opted_in(100, 1, True)
+    fed = []
+    recorder = type("R", (), {"feed": lambda self, uid, pcm: fed.append(uid)})()
+    on_packet = bot.packet_handler(100, recorder)
+    packet = type("P", (), {"pcm": b"x"})()
+    on_packet(FakeMember(1), packet)
+    on_packet(FakeMember(2), packet)
+    on_packet(FakeMember(3, bot=True), packet)
+    assert fed == [1]
+    bot.settings.set_opted_in(100, 2, True)
+    on_packet(FakeMember(2), packet)
+    assert fed == [1, 2]
+
+
+async def test_opting_out_ends_the_recording_when_nobody_is_left(tmp_path, monkeypatch):
+    bot = RecordingBot(Config(data_dir=tmp_path, leave_grace=0.0))
+    bot.settings.set_opted_in(100, 1, True)
     reasons = []
 
     async def teardown(guild_id, reason):
         reasons.append(reason)
         bot.recorders.pop(guild_id, None)
+        guild.voice_client = None
 
     monkeypatch.setattr(bot, "_teardown", teardown)
     channel = FakeChannel(1, members=[FakeMember(1), FakeMember(2)])
     guild = guild_with(channel)
     connected(guild, 1, bot)
 
-    bot.settings.set_autojoin(guild.id, False)
+    bot.settings.set_opted_in(100, 1, False)
     await bot.reconcile(guild)
-    assert reasons == ["auto-join disabled"]
+    assert reasons == ["nobody here has opted in"]
+
+
+async def test_newcomers_are_announced_once(bot):
+    channel = FakeChannel(1, members=[FakeMember(1), FakeMember(2), FakeMember(50)])
+    guild = guild_with(channel)
+    connected(guild, 1, bot)
+    bot._announced[guild.id] = {1, 2}
+
+    await bot.reconcile(guild)
+    assert channel.sent == []
+
+    bot.settings.set_opted_in(100, 50, True)
+    await bot.reconcile(guild)
+    await bot.reconcile(guild)
+    assert channel.sent == ["🔴 Also recording <@50>."]
+
+
+@dataclass
+class FakeResponse:
+    sent: list = field(default_factory=list)
+
+    async def send_message(self, message, *, ephemeral=False, **kwargs):
+        self.sent.append((message, ephemeral))
+
+
+@dataclass
+class FakeInteraction:
+    client: object
+    guild: object
+    user: object
+    channel_id: int = 0
+    response: FakeResponse = field(default_factory=FakeResponse)
+
+
+def _as_member(user_id, channel=None):
+    member = FakeMember(user_id)
+    member.mention = f"<@{user_id}>"
+    member.voice = type("V", (), {"channel": channel})() if channel else None
+    return member
+
+
+async def test_record_me_opts_in_publicly(tmp_path, monkeypatch):
+    bot = RecordingBot(Config(data_dir=tmp_path))
+    monkeypatch.setattr(bot, "reconcile", lambda guild: _record([], guild))
+    interaction = FakeInteraction(bot, FakeGuild(), _as_member(7))
+
+    await record_me.callback(interaction)
+    assert bot.settings.is_opted_in(100, 7)
+    message, ephemeral = interaction.response.sent[-1]
+    assert "<@7> opted in" in message and not ephemeral
+
+    await record_me.callback(interaction)
+    assert interaction.response.sent[-1][1] is True
+
+
+async def test_record_me_in_the_recorded_chat_is_not_announced_twice(bot, monkeypatch):
+    monkeypatch.setattr(bot, "reconcile", lambda guild: _record([], guild))
+    channel = FakeChannel(1, members=[FakeMember(1), FakeMember(2)])
+    guild = guild_with(channel)
+    connected(guild, 1, bot)
+    interaction = FakeInteraction(bot, guild, _as_member(50, channel), channel_id=1)
+
+    await record_me.callback(interaction)
+    assert "Recording them now." in interaction.response.sent[-1][0]
+    assert 50 in bot._announced[guild.id]
+
+
+async def test_stop_recording_me_opts_out_publicly(tmp_path, monkeypatch):
+    bot = RecordingBot(Config(data_dir=tmp_path))
+    monkeypatch.setattr(bot, "reconcile", lambda guild: _record([], guild))
+    bot.settings.set_opted_in(100, 7, True)
+    interaction = FakeInteraction(bot, FakeGuild(), _as_member(7))
+
+    await stop_recording_me.callback(interaction)
+    assert not bot.settings.is_opted_in(100, 7)
+    message, ephemeral = interaction.response.sent[-1]
+    assert "<@7> opted out" in message and not ephemeral
+
+    await stop_recording_me.callback(interaction)
+    assert interaction.response.sent[-1][1] is True
 
 
 # -- names ------------------------------------------------------------------

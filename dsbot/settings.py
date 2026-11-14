@@ -1,6 +1,8 @@
-"""Small JSON side-store for things the operator changes at runtime.
+"""Small JSON side-store for things that change at runtime.
 
 Kept deliberately outside the recordings so that deleting audio never loses it.
+
+*Who opted in to being recorded*, per server.
 
 *A speaker name cache* — the recordings are keyed by Discord user id, which is
 stable but unreadable.  We snapshot a display name the first time somebody's
@@ -75,12 +77,19 @@ class Settings:
             bucket[key] = value
         self.save()
 
-    def autojoin(self, guild_id: int, default: bool) -> bool:
-        value = self.guild_option(guild_id, "autojoin")
-        return default if value is None else bool(value)
+    def opted_in(self, guild_id: int) -> list[int]:
+        return [int(uid) for uid in self.guild_option(guild_id, "opted_in", [])]
 
-    def set_autojoin(self, guild_id: int, value: bool | None) -> None:
-        self.set_guild_option(guild_id, "autojoin", value)
+    def is_opted_in(self, guild_id: int, user_id: int) -> bool:
+        return user_id in self.opted_in(guild_id)
+
+    def set_opted_in(self, guild_id: int, user_id: int, value: bool) -> bool:
+        current = self.opted_in(guild_id)
+        if (user_id in current) == value:
+            return False
+        updated = current + [user_id] if value else [u for u in current if u != user_id]
+        self.set_guild_option(guild_id, "opted_in", updated or None)
+        return True
 
     # -- speaker names ------------------------------------------------------
 
