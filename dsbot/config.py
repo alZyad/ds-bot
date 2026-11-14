@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 try:  # optional, only used to load a local .env file
     from dotenv import load_dotenv
@@ -58,6 +59,9 @@ class Config:
     # output
     audio_bitrate: str = "64k"
     ffmpeg: str = "ffmpeg"
+    public_url: str = ""
+    web_port: int = 8080
+    timezone: str = "Europe/Paris"
 
     # behaviour
     announce: bool = True
@@ -85,6 +89,9 @@ class Config:
             max_speaker_tracks=_int("MAX_SPEAKER_TRACKS", 6),
             audio_bitrate=(os.getenv("AUDIO_BITRATE") or "64k").strip(),
             ffmpeg=(os.getenv("FFMPEG") or "ffmpeg").strip(),
+            public_url=(os.getenv("PUBLIC_URL") or "").strip(),
+            web_port=_int("WEB_PORT", 8080),
+            timezone=(os.getenv("TIMEZONE") or "Europe/Paris").strip(),
             announce=_bool("ANNOUNCE", True),
             include_channel_ids=_ids("INCLUDE_CHANNEL_IDS"),
             exclude_channel_ids=_ids("EXCLUDE_CHANNEL_IDS"),
@@ -110,6 +117,10 @@ class Config:
             raise ValueError("SESSION_GAP_SECONDS must be >= 0")
         if self.frame_ms not in (10, 20, 40, 60):
             raise ValueError("FRAME_MS must be one of 10, 20, 40, 60")
+        try:
+            ZoneInfo(self.timezone)
+        except (KeyError, ValueError) as exc:
+            raise ValueError(f"TIMEZONE {self.timezone!r} is not a known time zone") from exc
 
     # -- derived ------------------------------------------------------------
 
@@ -134,6 +145,14 @@ class Config:
     @property
     def session_gap_ms(self) -> int:
         return int(self.session_gap_seconds * 1000)
+
+    @property
+    def base_url(self) -> str:
+        return self.public_url or f"http://localhost:{self.web_port}"
+
+    @property
+    def tz(self) -> ZoneInfo:
+        return ZoneInfo(self.timezone)
 
     def channel_allowed(self, channel_id: int) -> bool:
         if self.include_channel_ids and channel_id not in self.include_channel_ids:

@@ -158,14 +158,15 @@ async def concat(
                     log.warning("skipping unreadable chunk %s", chunk.path)
         common = ("-hide_banner", "-loglevel", "error", "-i", str(joined))
         code, stderr = await _run(
-            binary, *common, "-c", "copy", "-f", "ipod", "-y", str(destination)
+            binary, *common, "-c", "copy", "-movflags", "+faststart",
+            "-f", "ipod", "-y", str(destination),
         )
         if code != 0 or not destination.exists():
             # A truncated final chunk can defeat stream copy.
             log.info("stream copy failed (%s), re-encoding", code)
             code, stderr = await _run(
                 binary, *common, "-c:a", "aac", "-b:a", bitrate,
-                "-f", "ipod", "-y", str(destination),
+                "-movflags", "+faststart", "-f", "ipod", "-y", str(destination),
             )
         if code != 0 or not destination.exists():
             raise FfmpegError(stderr.decode(errors="replace")[:500] or "ffmpeg failed")

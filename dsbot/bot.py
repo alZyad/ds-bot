@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import re
 import shutil
 import time
 
@@ -14,10 +15,13 @@ from discord.ext import commands, tasks, voice_recv
 
 from .config import Config
 from .encoder import ffmpeg_available
-from .format import human_duration
+from .format import file_stamp, human_duration
+from .links import Links
 from .recorder import ChannelRecorder
 from .settings import Settings
-from .store import ChunkStore, now_ms
+from .store import MIX_TRACK, ChunkStore, now_ms
+from .ui import recordings
+from .web import Exporter, start_web
 
 log = logging.getLogger(__name__)
 
@@ -39,6 +43,11 @@ class RecordingBot(commands.Bot):
             cfg.data_dir / "recordings", max_bytes=cfg.max_disk_bytes
         )
         self.settings = Settings(cfg.data_dir / "settings.json")
+        self.links = Links(cfg.token, cfg.base_url)
+        self.exporter = Exporter(
+            self.store, cfg.data_dir / "exports", binary=cfg.ffmpeg, bitrate=cfg.audio_bitrate
+        )
+        self._web = None
         self.recorders: dict[int, ChannelRecorder] = {}  # guild_id -> recorder
         self._guild_locks: dict[int, asyncio.Lock] = {}
         self._eligible_since: dict[int, float] = {}  # channel_id -> monotonic
@@ -58,6 +67,7 @@ class RecordingBot(commands.Bot):
             log.info("removed %d stale .part file(s) from a previous run", removed)
         # Exports are throwaway; a crash mid-upload must not leak disk.
         shutil.rmtree(self.cfg.data_dir / "exports", ignore_errors=True)
+        self._web = await start_web(self, self.cfg.web_port)
         await self.tree.sync()
         self.reconcile_loop.start()
 
@@ -68,6 +78,8 @@ class RecordingBot(commands.Bot):
         for guild_id in list(self.recorders):
             with contextlib.suppress(Exception):
                 await self._teardown(guild_id, reason="shutting down")
+        if self._web is not None:
+            await self._web.cleanup()
         await super().close()
 
     async def on_ready(self) -> None:
@@ -272,7 +284,7 @@ class RecordingBot(commands.Bot):
             channel,
             f"🔴 Recording in **{channel.name}**: {_mentions(people)}. Nobody else "
             "in here is recorded. `/record-me` to be included, `/stop-recording-me` "
-            "to stop.",
+            "to stop, `/recordings` to listen.",
         )
 
     def packet_handler(self, guild_id: int, recorder: ChannelRecorder):
@@ -308,14 +320,19 @@ class RecordingBot(commands.Bot):
             self._left_at[guild_id] = now_ms()
             channel = guild.get_channel(recorder.channel_id) if guild else None
             session = self.store.session(guild_id, recorder.session_ms)
-            duration = session.duration_ms if session is not None else 0
             if channel is not None:
-                await self._announce(
-                    channel,
-                    f"⏹️ Stopped recording **{channel.name}** ({reason}). "
-                    f"This session: {human_duration(duration)} of speech.",
-                )
+                await self._announce(channel, self._stop_message(channel, session, reason))
         log.info("torn down guild %s: %s", guild_id, reason)
+
+    def _stop_message(self, channel, session, reason: str) -> str:
+        message = f"⏹️ Stopped recording **{channel.name}** ({reason})."
+        if session is None or not session.mix:
+            return f"{message} Nothing was said."
+        url = self.links.session_url(session.guild_id, session.session_ms, MIX_TRACK)
+        return (
+            f"{message} This session: {human_duration(session.duration_ms)} of speech, "
+            f"[listen](<{url}>). `/recordings` for each voice."
+        )
 
     async def _announce(self, channel, message: str) -> None:
         if not self.cfg.announce:
@@ -346,6 +363,16 @@ class RecordingBot(commands.Bot):
         if member is not None:
             return _member_label(member)
         return self.settings.name_for(user_id) or f"user {user_id}"
+
+    def short_name(self, guild: discord.Guild, user_id: int) -> str:
+        return self.speaker_label(guild, user_id).split(" (@")[0].lstrip("@")
+
+    def download_name(self, guild_id: int, session_ms: int, track: str) -> str:
+        label = "everyone" if track == MIX_TRACK else self.short_name(
+            self.get_guild(guild_id), int(track)
+        )
+        safe = re.sub(r"[^A-Za-z0-9]+", "-", label).strip("-") or "voice"
+        return f"{file_stamp(session_ms, self.cfg.tz)}_{safe}.m4a"
 
 
 def _member_label(member) -> str:
@@ -413,7 +440,7 @@ async def stop_recording_me(interaction: discord.Interaction) -> None:
     await bot.reconcile(guild)
 
 
-COMMANDS = [record_me, stop_recording_me]
+COMMANDS = [record_me, stop_recording_me, recordings]
 
 
 def build_bot(cfg: Config) -> RecordingBot:

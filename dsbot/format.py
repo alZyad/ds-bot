@@ -29,11 +29,9 @@ def discord_time(ms: int, style: str = "f") -> str:
     return f"<t:{int(ms / 1000)}:{style}>"
 
 
-def iso(ms: int) -> str:
-    return dt.datetime.fromtimestamp(ms / 1000, dt.UTC).strftime(
-        "%Y-%m-%d %H:%M:%SZ"
-    )
+def local_label(ms: int, tz: dt.tzinfo) -> str:
+    return dt.datetime.fromtimestamp(ms / 1000, tz).strftime("%a %d %b, %H:%M")
 
 
-def slug(ms: int) -> str:
-    return dt.datetime.fromtimestamp(ms / 1000, dt.UTC).strftime("%Y%m%d-%H%M%S")
+def file_stamp(ms: int, tz: dt.tzinfo) -> str:
+    return dt.datetime.fromtimestamp(ms / 1000, tz).strftime("%Y-%m-%d_%Hh%M")

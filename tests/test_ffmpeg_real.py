@@ -86,6 +86,8 @@ async def test_chunks_concatenate_into_a_playable_m4a(tmp_path):
     duration = float(info["format"]["duration"])
     assert 3.0 <= duration < 3.3
     assert not list((tmp_path / "work").glob("*.joined.aac"))
+    data = destination.read_bytes()
+    assert data.index(b"moov") < data.index(b"mdat")
 
 
 async def test_the_output_format_flag_is_load_bearing(tmp_path):
