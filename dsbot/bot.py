@@ -58,6 +58,7 @@ class RecordingBot(commands.Bot):
         self._left_at: dict[int, int] = {}
         self._announced: dict[int, set[int]] = {}
         self._presence: str | None = None
+        self._dave_status: dict[int, str] = {}
 
     # -- setup --------------------------------------------------------------
 
@@ -151,6 +152,15 @@ class RecordingBot(commands.Bot):
         for guild in self.guilds:
             with contextlib.suppress(Exception):
                 await self.reconcile(guild)
+            self._log_dave_status(guild)
+
+    def _log_dave_status(self, guild) -> None:
+        voice = guild.voice_client
+        status = dave.describe(voice) if voice is not None else None
+        if status != self._dave_status.get(guild.id):
+            self._dave_status[guild.id] = status
+            if status is not None:
+                log.info("DAVE status in guild %s: %s", guild.id, status)
 
     @reconcile_loop.before_loop
     async def _before_reconcile(self) -> None:

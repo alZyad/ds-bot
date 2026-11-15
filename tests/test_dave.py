@@ -69,3 +69,11 @@ def test_a_corrupt_frame_decodes_to_silence_instead_of_crashing():
     packet = Packet()
     _, pcm = dave.PacketDecoder._decode_packet(decoder, packet)
     assert pcm == dave.SILENT_FRAME
+
+
+def test_describe_reports_the_session_state():
+    assert dave.describe(voice(None)) == "version=1 no session"
+    session = Session()
+    session.status, session.epoch = "active", 3
+    session.get_user_ids = lambda: ["42"]
+    assert dave.describe(voice(session)) == "version=1 status=active ready=True epoch=3 users=['42']"

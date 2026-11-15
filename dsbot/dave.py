@@ -43,6 +43,18 @@ def dave_decrypt(voice_client, ssrc: int, data: bytes) -> bytes:
     return plain
 
 
+def describe(voice_client) -> str:
+    state = getattr(voice_client, "_connection", None)
+    session = getattr(state, "dave_session", None)
+    version = getattr(state, "dave_protocol_version", 0)
+    if session is None:
+        return f"version={version} no session"
+    return (
+        f"version={version} status={session.status} ready={session.ready} "
+        f"epoch={session.epoch} users={session.get_user_ids()}"
+    )
+
+
 class DaveDecryptor:
     def __init__(self, inner, voice_client) -> None:
         self._inner = inner
