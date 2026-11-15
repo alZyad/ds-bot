@@ -90,12 +90,11 @@ def make_app(bot: RecordingBot) -> web.Application:
         match = SNAPSHOT_RE.match(name)
         if match is None or not bot.links.verify(name, request.match_info["sig"]):
             raise web.HTTPNotFound()
+        guild_id, session_ms, track = int(match["guild"]), int(match["session"]), match["track"]
         path = bot.exporter.directory / name
         if not path.is_file():
-            raise web.HTTPNotFound()
-        filename = bot.download_name(
-            int(match["guild"]), int(match["session"]), match["track"]
-        )
+            raise web.HTTPFound(bot.links.session_path(guild_id, session_ms, track))
+        filename = bot.download_name(guild_id, session_ms, track)
         return web.FileResponse(path, headers={
             "Content-Type": "audio/mp4",
             "Content-Disposition": f'inline; filename="{filename}"',

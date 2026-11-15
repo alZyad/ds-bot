@@ -15,9 +15,12 @@ class Links:
     def verify(self, text: str, signature: str) -> bool:
         return hmac.compare_digest(self.sign(text), signature)
 
-    def session_url(self, guild_id: int, session_ms: int, track: str) -> str:
+    def session_path(self, guild_id: int, session_ms: int, track: str) -> str:
         path = f"{guild_id}/{session_ms}/{track}"
-        return f"{self.base_url}/r/{path}/{self.sign(path)}.m4a"
+        return f"/r/{path}/{self.sign(path)}.m4a"
+
+    def session_url(self, guild_id: int, session_ms: int, track: str) -> str:
+        return self.base_url + self.session_path(guild_id, session_ms, track)
 
     def file_path(self, name: str) -> str:
         return f"/f/{self.sign(name)}/{name}"

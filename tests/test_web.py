@@ -115,3 +115,13 @@ def test_exports_are_pruned_by_age_and_size(cfg, monkeypatch):
     monkeypatch.setattr(web, "EXPORT_MAX_BYTES", 150)
     bot.exporter.prune(keep=keep)
     assert sorted(p.name for p in directory.iterdir()) == [keep.name]
+
+
+async def test_a_stale_snapshot_link_falls_back_to_the_session(client):
+    write(client.bot, 1000, 0, b"aaa")
+    first = await client.get(link(client.bot, 1000))
+    for path in client.bot.exporter.directory.iterdir():
+        path.unlink()
+    write(client.bot, 1000, 1, b"bbb")
+    again = await client.get(first.url.path)
+    assert await again.read() == b"aaabbb"

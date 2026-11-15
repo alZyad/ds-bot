@@ -58,7 +58,8 @@ signed with an HMAC keyed on the bot token, so links cannot be guessed and stay
 valid until the session is deleted (or the token changes). Opening one joins the
 session's chunks into an `.m4a` (no re-encode, cached in `data/exports`, pruned
 after 24 h or past 1 GiB) and redirects to that immutable file, so seeking works
-even while the session keeps growing. A live session is flushed first, so the
+even while the session keeps growing. A snapshot URL that has since been pruned
+redirects back to its session, so a copied address keeps working. A live session is flushed first, so the
 last sentence is included.
 
 The bot does not terminate TLS; put it behind a reverse proxy (Caddy:
