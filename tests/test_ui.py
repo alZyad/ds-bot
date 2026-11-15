@@ -3,7 +3,7 @@ from dataclasses import dataclass, field
 from dsbot.bot import RecordingBot
 from dsbot.config import Config
 from dsbot.store import MIX_TRACK
-from dsbot.ui import DeleteButton, RecordingsView, SessionSelect, render
+from dsbot.ui import DeleteButton, RecordingsView, SessionSelect, recordings, render
 
 
 @dataclass
@@ -99,3 +99,24 @@ def test_the_stop_notice_links_the_session(tmp_path):
     write(bot, 1_000_000)
     text = bot._stop_message(channel, bot.store.session(100, 1_000_000), "bye")
     assert "1m30s of speech, [listen](<https://rec.example/r/100/1000000/mix/" in text
+
+
+async def test_opening_recordings_flushes_the_live_session_first(tmp_path):
+    bot = make_bot(tmp_path)
+    sent = []
+
+    class Recorder(Live):
+        async def flush(self):
+            write(bot, self.session_ms)
+
+    bot.recorders[100] = Recorder(2_000_000)
+    response = type("R", (), {"send_message": lambda self, text, **kw: _append(sent, text)})()
+    interaction = type("I", (), {
+        "client": bot, "guild": Guild(), "user": object(), "response": response,
+    })()
+    await recordings.callback(interaction)
+    assert "[Everyone](<https://rec.example/r/100/2000000/mix/" in sent[0]
+
+
+async def _append(sink, value):
+    sink.append(value)

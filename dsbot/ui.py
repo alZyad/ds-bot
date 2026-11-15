@@ -20,6 +20,12 @@ def live_session(bot: RecordingBot, guild_id: int) -> int | None:
     return recorder.session_ms if recorder is not None else None
 
 
+async def flush_live(bot: RecordingBot, guild_id: int) -> None:
+    recorder = bot.recorders.get(guild_id)
+    if recorder is not None:
+        await recorder.flush()
+
+
 def session_ids(bot: RecordingBot, guild_id: int) -> list[int]:
     ids = {s.session_ms for s in bot.store.sessions(guild_id)}
     live = live_session(bot, guild_id)
@@ -136,6 +142,7 @@ class SessionSelect(discord.ui.Select):
         self.owner = owner
 
     async def callback(self, interaction: discord.Interaction) -> None:
+        await flush_live(self.owner.bot, self.owner.guild.id)
         view = self.owner.reopen(int(self.values[0]))
         await interaction.response.edit_message(content=view.content(), view=view)
 
@@ -183,6 +190,7 @@ class ConfirmDelete(discord.ui.View):
 async def recordings(interaction: discord.Interaction) -> None:
     bot: RecordingBot = interaction.client
     guild = interaction.guild
+    await flush_live(bot, guild.id)
     ids = session_ids(bot, guild.id)
     permissions = getattr(interaction.user, "guild_permissions", None)
     view = RecordingsView(
