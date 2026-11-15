@@ -31,9 +31,6 @@ def dave_decrypt(voice_client, ssrc: int, data: bytes) -> bytes:
     if user_id is None:
         _report_once(("unknown", ssrc), "DAVE: audio from unmapped ssrc %s dropped", ssrc)
         return b""
-    if not session.ready:
-        _report_once(("not-ready", user_id), "DAVE: session not ready, dropping %s", user_id)
-        return b""
     try:
         plain = session.decrypt(user_id, davey.MediaType.audio, data) or b""
     except ValueError as exc:

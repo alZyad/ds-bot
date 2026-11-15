@@ -40,9 +40,12 @@ def test_without_dave_frames_pass_through():
 def test_undecryptable_frames_become_empty():
     assert dave.dave_decrypt(voice(Session(fail=True)), 7, b"x") == b""
     assert dave.dave_decrypt(voice(Session()), 8, b"x") == b""
-    not_ready = Session()
-    not_ready.ready = False
-    assert dave.dave_decrypt(voice(not_ready), 7, b"x") == b""
+
+
+def test_a_session_not_ready_to_send_still_decrypts():
+    listening = Session()
+    listening.ready = False
+    assert dave.dave_decrypt(voice(listening), 7, b"x") == b"plain:x"
 
 
 def test_install_wraps_the_reader_decryptor_once():
