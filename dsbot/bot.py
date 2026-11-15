@@ -13,6 +13,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands, tasks, voice_recv
 
+from . import dave
 from .config import Config
 from .encoder import ffmpeg_available
 from .format import file_stamp, human_duration
@@ -297,6 +298,7 @@ class RecordingBot(commands.Bot):
 
         try:
             voice.listen(voice_recv.BasicSink(self.packet_handler(guild.id, recorder)))
+            dave.install(voice)
         except Exception:
             log.exception("could not start listening in %s", channel)
             await self._teardown(guild.id, reason="listen failed")
