@@ -13,6 +13,13 @@ except ImportError:
 log = logging.getLogger(__name__)
 
 SILENT_FRAME = b"\x00" * Decoder.FRAME_SIZE
+_reported: set[tuple] = set()
+
+
+def _report_once(key: tuple, message: str, *args) -> None:
+    if key not in _reported:
+        _reported.add(key)
+        log.info(message, *args)
 
 
 def dave_decrypt(voice_client, ssrc: int, data: bytes) -> bytes:
@@ -21,13 +28,19 @@ def dave_decrypt(voice_client, ssrc: int, data: bytes) -> bytes:
     if davey is None or session is None or not getattr(state, "dave_protocol_version", 0):
         return data
     user_id = voice_client._get_id_from_ssrc(ssrc)
-    if user_id is None or not session.ready:
+    if user_id is None:
+        _report_once(("unknown", ssrc), "DAVE: audio from unmapped ssrc %s dropped", ssrc)
+        return b""
+    if not session.ready:
+        _report_once(("not-ready", user_id), "DAVE: session not ready, dropping %s", user_id)
         return b""
     try:
-        return session.decrypt(user_id, davey.MediaType.audio, data) or b""
+        plain = session.decrypt(user_id, davey.MediaType.audio, data) or b""
     except ValueError as exc:
-        log.debug("DAVE decrypt failed for ssrc %s: %s", ssrc, exc)
+        _report_once(("failed", user_id, str(exc)), "DAVE: cannot decrypt %s: %s", user_id, exc)
         return b""
+    _report_once(("ok", user_id), "DAVE: decrypting voice of %s", user_id)
+    return plain
 
 
 class DaveDecryptor:
@@ -43,6 +56,7 @@ class DaveDecryptor:
 
 
 def install(voice_client) -> None:
+    _reported.clear()
     reader = voice_client._reader
     if not isinstance(reader.decryptor, DaveDecryptor):
         reader.decryptor = DaveDecryptor(reader.decryptor, voice_client)

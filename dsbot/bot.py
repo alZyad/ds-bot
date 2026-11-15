@@ -314,10 +314,16 @@ class RecordingBot(commands.Bot):
         )
 
     def packet_handler(self, guild_id: int, recorder: ChannelRecorder):
+        heard: set[int] = set()
+
         def on_packet(user, data) -> None:
             if user is None or getattr(user, "bot", False) or not data.pcm:
                 return
-            if self.settings.is_opted_in(guild_id, user.id):
+            opted = self.settings.is_opted_in(guild_id, user.id)
+            if user.id not in heard:
+                heard.add(user.id)
+                log.info("first audio from %s (opted in: %s)", user.id, opted)
+            if opted:
                 recorder.feed(user.id, data.pcm)
 
         return on_packet
