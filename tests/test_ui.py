@@ -40,8 +40,7 @@ def make_bot(tmp_path):
 
 def test_an_empty_server_explains_how_to_start(tmp_path):
     text = render(make_bot(tmp_path), Guild(), None)
-    assert "recorded: nobody yet" in text
-    assert "No recordings." in text
+    assert text == "No recordings · opted in: nobody"
 
 
 def test_a_session_links_everyone_and_each_voice(tmp_path):
@@ -53,7 +52,8 @@ def test_a_session_links_everyone_and_each_voice(tmp_path):
     guild = Guild(people={7: Member(7, "zyad", "Zy[a]d")})
 
     text = render(bot, guild, 1_000_000)
-    assert "recorded: <@7>" in text
+    assert text.startswith("1 session · opted in: <@7>\n")
+    assert text.endswith("\n-# 0% full")
     assert "**<t:1000:f> → <t:1090:t>** · 1m30s" in text
     assert "[All](<https://rec.example/r/100/1000000/mix/" in text
     assert "[Zyad](<https://rec.example/r/100/1000000/7/" in text

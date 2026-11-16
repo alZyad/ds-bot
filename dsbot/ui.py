@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING
 import discord
 from discord import app_commands
 
-from .format import discord_time, human_duration, human_size, local_label
+from .format import discord_time, human_duration, local_label
 from .store import MIX_TRACK, Session
 
 if TYPE_CHECKING:
@@ -45,15 +45,13 @@ def _link(label: str, url: str) -> str:
 
 def render(bot: RecordingBot, guild, session_ms: int | None) -> str:
     opted = bot.settings.opted_in(guild.id)
-    header = (
-        f"**Recordings** · {human_size(bot.store.total_bytes())} of "
-        f"{human_size(bot.cfg.max_disk_bytes)} used · recorded: "
-        f"{_mentions(opted) if opted else 'nobody yet'}"
-    )
-    lines = [header]
+    count = len(session_ids(bot, guild.id))
+    sessions = f"{count} session{'' if count == 1 else 's'}" if count else "No recordings"
+    header = f"{sessions} · opted in: {_mentions(opted) if opted else 'nobody'}"
     if session_ms is None:
-        lines.append("No recordings.")
-        return "\n".join(lines)
+        return header
+    footer = f"-# {round(100 * bot.store.total_bytes() / bot.cfg.max_disk_bytes)}% full"
+    lines = [header]
 
     session = bot.store.session(guild.id, session_ms)
     recorder = bot.recorders.get(guild.id)
@@ -67,8 +65,7 @@ def render(bot: RecordingBot, guild, session_ms: int | None) -> str:
     )
     lines.append(f"\n{when} · {human_duration(duration)}")
     if session is None or not session.mix:
-        lines.append("No audio.")
-        return "\n".join(lines)
+        return "\n".join([*lines, "No audio.", footer])
 
     text = "\n".join(lines)
     links = [_link("All", bot.links.session_url(guild.id, session_ms, MIX_TRACK))]
@@ -80,7 +77,7 @@ def render(bot: RecordingBot, guild, session_ms: int | None) -> str:
         if len(text) + len(" · ".join([*links, link])) + 3 > MESSAGE_BUDGET:
             break
         links.append(link)
-    return f"{text}\n▶ {' · '.join(links)}"
+    return f"{text}\n▶ {' · '.join(links)}\n{footer}"
 
 
 def _option(bot: RecordingBot, guild, session_ms: int, session: Session | None, selected):

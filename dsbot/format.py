@@ -16,14 +16,6 @@ def human_duration(ms: float) -> str:
     return f"{hours}h{minutes:02d}m"
 
 
-def human_size(num_bytes: float) -> str:
-    for unit in ("B", "KiB", "MiB", "GiB"):
-        if abs(num_bytes) < 1024 or unit == "GiB":
-            return f"{num_bytes:.1f} {unit}" if unit != "B" else f"{num_bytes:.0f} B"
-        num_bytes /= 1024
-    return f"{num_bytes:.1f} GiB"  # pragma: no cover
-
-
 def discord_time(ms: int, style: str = "f") -> str:
     """A Discord timestamp markup, rendered in each reader's own timezone."""
     return f"<t:{int(ms / 1000)}:{style}>"

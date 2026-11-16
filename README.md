@@ -46,7 +46,7 @@ Why each piece is the way it is: [`docs/DESIGN.md`](docs/DESIGN.md).
 | --- | --- |
 | `/record-me` | Opt in: you are recorded whenever you're in a voice channel with someone else. Public. |
 | `/stop-recording-me` | Opt out. What was already recorded stays until it rotates out. Public. |
-| `/recordings` | The latest session: when, how long, who, and links. A picker switches between the last 25 sessions; **Manage Server** also gets *Delete*. Only you see it. |
+| `/recordings` | Session count, who is opted in, and the latest session: when, how long, a link per voice. Storage use as a footnote. A picker switches between the last 25 sessions; **Manage Server** also gets *Delete*. Only you see it. |
 | `/help` | The commands and the rules, in four lines. Only you see it. |
 
 ## Links
