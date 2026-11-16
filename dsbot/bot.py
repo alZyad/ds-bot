@@ -482,7 +482,23 @@ async def stop_recording_me(interaction: discord.Interaction) -> None:
     await bot.reconcile(guild)
 
 
-COMMANDS = [record_me, stop_recording_me, recordings]
+def help_text(cfg: Config) -> str:
+    return (
+        "`/record-me`: opt in\n"
+        "`/stop-recording-me`: opt out\n"
+        "`/recordings`: sessions + links\n"
+        f"Records opted-in voices only, in channels with {cfg.min_speakers}+ people. "
+        "Oldest sessions deleted when full."
+    )
+
+
+@app_commands.command(name="help", description="Commands")
+async def help_command(interaction: discord.Interaction) -> None:
+    bot: RecordingBot = interaction.client
+    await _reply(interaction, help_text(bot.cfg), public=False)
+
+
+COMMANDS = [record_me, stop_recording_me, recordings, help_command]
 
 
 def build_bot(cfg: Config) -> RecordingBot:

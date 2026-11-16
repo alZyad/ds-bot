@@ -9,7 +9,13 @@ from dataclasses import dataclass, field
 
 import pytest
 
-from dsbot.bot import RecordingBot, _member_label, record_me, stop_recording_me
+from dsbot.bot import (
+    RecordingBot,
+    _member_label,
+    help_command,
+    record_me,
+    stop_recording_me,
+)
 from dsbot.config import Config
 
 
@@ -435,6 +441,18 @@ async def test_stop_recording_me_opts_out_publicly(tmp_path, monkeypatch):
 
     await stop_recording_me.callback(interaction)
     assert interaction.response.sent[-1][1] is True
+
+
+async def test_help_lists_the_commands_privately(tmp_path):
+    bot = RecordingBot(Config(data_dir=tmp_path))
+    interaction = FakeInteraction(bot, FakeGuild(), _as_member(7))
+
+    await help_command.callback(interaction)
+    message, ephemeral = interaction.response.sent[-1]
+    assert ephemeral
+    for command in ("/record-me", "/stop-recording-me", "/recordings"):
+        assert f"`{command}`" in message
+    assert "2+ people" in message
 
 
 # -- names ------------------------------------------------------------------
