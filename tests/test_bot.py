@@ -224,7 +224,7 @@ async def test_reconcile_moves_when_the_channel_empties(bot, monkeypatch):
     connected(guild, 1, bot)
 
     await bot.reconcile(guild)  # leave_grace is 0 in this fixture
-    assert calls == [("teardown", "fewer than 2 people"), ("setup", 2)]
+    assert calls == [("teardown", "<2 people"), ("setup", 2)]
 
 
 async def test_a_blip_does_not_sever_the_recording(tmp_path, monkeypatch):
@@ -268,7 +268,7 @@ async def test_the_grace_period_does_expire(tmp_path, monkeypatch):
     await bot.reconcile(guild)
     assert calls == []                    # inside the grace window
     await asyncio.sleep(0.15)             # the scheduled re-check fires
-    assert calls == ["fewer than 2 people"]
+    assert calls == ["<2 people"]
 
 
 async def test_reconcile_leaves_when_nothing_is_eligible(bot, monkeypatch):
@@ -360,7 +360,7 @@ async def test_opting_out_ends_the_recording_when_nobody_is_left(tmp_path, monke
 
     bot.settings.set_opted_in(100, 1, False)
     await bot.reconcile(guild)
-    assert reasons == ["nobody here has opted in"]
+    assert reasons == ["no opted-in user"]
 
 
 async def test_newcomers_are_announced_once(bot):
@@ -375,7 +375,7 @@ async def test_newcomers_are_announced_once(bot):
     bot.settings.set_opted_in(100, 50, True)
     await bot.reconcile(guild)
     await bot.reconcile(guild)
-    assert channel.sent == ["🔴 Also recording <@50>."]
+    assert channel.sent == ["🔴 +<@50>"]
 
 
 @dataclass
@@ -424,7 +424,7 @@ async def test_record_me_in_the_recorded_chat_is_not_announced_twice(bot, monkey
     interaction = FakeInteraction(bot, guild, _as_member(50, channel), channel_id=1)
 
     await record_me.callback(interaction)
-    assert "Recording them now." in interaction.response.sent[-1][0]
+    assert "Recording now." in interaction.response.sent[-1][0]
     assert 50 in bot._announced[guild.id]
 
 

@@ -80,7 +80,7 @@ class RecordingBot(commands.Bot):
             task.cancel()
         for guild_id in list(self.recorders):
             with contextlib.suppress(Exception):
-                await self._teardown(guild_id, reason="shutting down")
+                await self._teardown(guild_id, reason="restart")
         if self._web is not None:
             await self._web.cleanup()
         await super().close()
@@ -134,8 +134,8 @@ class RecordingBot(commands.Bot):
 
     def _why_not(self, channel) -> str:
         if not self.recorded_in(channel):
-            return "nobody here has opted in"
-        return f"fewer than {self.cfg.min_speakers} people"
+            return "no opted-in user"
+        return f"<{self.cfg.min_speakers} people"
 
     # -- reconciliation -----------------------------------------------------
 
@@ -311,16 +311,14 @@ class RecordingBot(commands.Bot):
             dave.install(voice)
         except Exception:
             log.exception("could not start listening in %s", channel)
-            await self._teardown(guild.id, reason="listen failed")
+            await self._teardown(guild.id, reason="error")
             return
 
         people = self.recorded_in(channel)
         self._announced[guild.id] = {m.id for m in people}
         await self._announce(
             channel,
-            f"🔴 Recording in **{channel.name}**: {_mentions(people)}. Nobody else "
-            "in here is recorded. `/record-me` to be included, `/stop-recording-me` "
-            "to stop, `/recordings` to listen.",
+            f"🔴 Recording {_mentions(people)}. Nobody else. `/help`",
         )
 
     def packet_handler(self, guild_id: int, recorder: ChannelRecorder):
@@ -344,7 +342,7 @@ class RecordingBot(commands.Bot):
         if not fresh:
             return
         announced.update(m.id for m in fresh)
-        await self._announce(channel, f"🔴 Also recording {_mentions(fresh)}.")
+        await self._announce(channel, f"🔴 +{_mentions(fresh)}")
 
     async def _teardown(self, guild_id: int, *, reason: str) -> None:
         self._cancel_grace(guild_id)
@@ -363,18 +361,15 @@ class RecordingBot(commands.Bot):
             channel = guild.get_channel(recorder.channel_id) if guild else None
             session = self.store.session(guild_id, recorder.session_ms)
             if channel is not None:
-                await self._announce(channel, self._stop_message(channel, session, reason))
+                await self._announce(channel, self._stop_message(session, reason))
         log.info("torn down guild %s: %s", guild_id, reason)
 
-    def _stop_message(self, channel, session, reason: str) -> str:
-        message = f"⏹️ Stopped recording **{channel.name}** ({reason})."
+    def _stop_message(self, session, reason: str) -> str:
+        message = f"⏹️ Stopped ({reason})"
         if session is None or not session.mix:
-            return f"{message} Nothing was said."
+            return f"{message} · empty"
         url = self.links.session_url(session.guild_id, session.session_ms, MIX_TRACK)
-        return (
-            f"{message} This session: {human_duration(session.duration_ms)} of speech, "
-            f"[listen](<{url}>). `/recordings` for each voice."
-        )
+        return f"{message} · {human_duration(session.duration_ms)} · [listen](<{url}>)"
 
     async def _announce(self, channel, message: str) -> None:
         if not self.cfg.announce:
@@ -438,15 +433,13 @@ async def _reply(interaction: discord.Interaction, message: str, *, public: bool
     )
 
 
-@app_commands.command(name="record-me", description="Let the bot record your voice")
+@app_commands.command(name="record-me", description="Opt in to recording")
 @app_commands.guild_only()
 async def record_me(interaction: discord.Interaction) -> None:
     bot: RecordingBot = interaction.client
     guild, user = interaction.guild, interaction.user
     if not bot.settings.set_opted_in(guild.id, user.id, True):
-        await _reply(
-            interaction, "You're already recorded. `/stop-recording-me` to stop.", public=False
-        )
+        await _reply(interaction, "Already opted in.", public=False)
         return
     recorder = bot.recorders.get(guild.id)
     here = recorder is not None and _voice_channel_id(user) == recorder.channel_id
@@ -454,29 +447,24 @@ async def record_me(interaction: discord.Interaction) -> None:
         bot._announced.setdefault(guild.id, set()).add(user.id)
     await _reply(
         interaction,
-        f"🎙️ {user.mention} opted in: I record their voice whenever they're in a voice "
-        "channel with someone else. `/record-me` to join them, `/stop-recording-me` "
-        "to stop, `/recordings` to listen." + (" Recording them now." if here else ""),
+        f"🎙️ {user.mention} opted in." + (" Recording now." if here else ""),
         public=True,
     )
     await bot.reconcile(guild)
 
 
-@app_commands.command(name="stop-recording-me", description="Stop the bot recording your voice")
+@app_commands.command(name="stop-recording-me", description="Opt out")
 @app_commands.guild_only()
 async def stop_recording_me(interaction: discord.Interaction) -> None:
     bot: RecordingBot = interaction.client
     guild, user = interaction.guild, interaction.user
     if not bot.settings.set_opted_in(guild.id, user.id, False):
-        await _reply(
-            interaction, "I'm not recording you. `/record-me` to opt in.", public=False
-        )
+        await _reply(interaction, "Not opted in.", public=False)
         return
     bot._announced.get(guild.id, set()).discard(user.id)
     await _reply(
         interaction,
-        f"🔕 {user.mention} opted out: I no longer record their voice. What was "
-        "already recorded stays until it rotates out.",
+        f"🔕 {user.mention} opted out. Past recordings kept.",
         public=True,
     )
     await bot.reconcile(guild)

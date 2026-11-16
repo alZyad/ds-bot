@@ -41,7 +41,7 @@ def make_bot(tmp_path):
 def test_an_empty_server_explains_how_to_start(tmp_path):
     text = render(make_bot(tmp_path), Guild(), None)
     assert "recorded: nobody yet" in text
-    assert "Nothing recorded yet" in text
+    assert "No recordings." in text
 
 
 def test_a_session_links_everyone_and_each_voice(tmp_path):
@@ -54,9 +54,8 @@ def test_a_session_links_everyone_and_each_voice(tmp_path):
 
     text = render(bot, guild, 1_000_000)
     assert "recorded: <@7>" in text
-    assert "<t:1000:f>" in text and "1m30s of speech" in text
-    assert "People: <@7>" in text
-    assert "[Everyone](<https://rec.example/r/100/1000000/mix/" in text
+    assert "**<t:1000:f> → <t:1090:t>** · 1m30s" in text
+    assert "[All](<https://rec.example/r/100/1000000/mix/" in text
     assert "[Zyad](<https://rec.example/r/100/1000000/7/" in text
 
 
@@ -65,7 +64,7 @@ def test_a_live_session_with_nothing_said_yet(tmp_path):
     bot.recorders[100] = Live(2_000_000)
     text = render(bot, Guild(), 2_000_000)
     assert "🔴 live in <#1>" in text
-    assert "Nothing said yet." in text
+    assert "No audio." in text
 
 
 def test_many_voices_stay_within_one_message(tmp_path):
@@ -94,11 +93,10 @@ async def test_admins_can_delete_finished_sessions_only(tmp_path):
 
 def test_the_stop_notice_links_the_session(tmp_path):
     bot = make_bot(tmp_path)
-    channel = type("C", (), {"name": "general"})()
-    assert bot._stop_message(channel, None, "bye").endswith("Nothing was said.")
+    assert bot._stop_message(None, "bye") == "⏹️ Stopped (bye) · empty"
     write(bot, 1_000_000)
-    text = bot._stop_message(channel, bot.store.session(100, 1_000_000), "bye")
-    assert "1m30s of speech, [listen](<https://rec.example/r/100/1000000/mix/" in text
+    text = bot._stop_message(bot.store.session(100, 1_000_000), "bye")
+    assert text.startswith("⏹️ Stopped (bye) · 1m30s · [listen](<https://rec.example/r/100/1000000/mix/")
 
 
 async def test_opening_recordings_flushes_the_live_session_first(tmp_path):
@@ -115,7 +113,7 @@ async def test_opening_recordings_flushes_the_live_session_first(tmp_path):
         "client": bot, "guild": Guild(), "user": object(), "response": response,
     })()
     await recordings.callback(interaction)
-    assert "[Everyone](<https://rec.example/r/100/2000000/mix/" in sent[0]
+    assert "[All](<https://rec.example/r/100/2000000/mix/" in sent[0]
 
 
 async def _append(sink, value):

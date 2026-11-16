@@ -52,34 +52,26 @@ def render(bot: RecordingBot, guild, session_ms: int | None) -> str:
     )
     lines = [header]
     if session_ms is None:
-        lines.append(
-            "Nothing recorded yet. `/record-me` to be recorded whenever you're in a "
-            "voice channel with someone else."
-        )
+        lines.append("No recordings.")
         return "\n".join(lines)
 
     session = bot.store.session(guild.id, session_ms)
     recorder = bot.recorders.get(guild.id)
     live = recorder is not None and recorder.session_ms == session_ms
     duration = session.duration_ms if session else 0
-    status = (
-        f"🔴 live in <#{recorder.channel_id}>"
+    start = discord_time(session_ms, "f")
+    when = (
+        f"**{start}** 🔴 live in <#{recorder.channel_id}>"
         if live
-        else f"→ {discord_time(session.end_ms if session else session_ms, 't')}"
+        else f"**{start} → {discord_time(session.end_ms if session else session_ms, 't')}**"
     )
-    lines.append(
-        f"\n**{discord_time(session_ms, 'f')}** {status} · "
-        f"{human_duration(duration)} of speech"
-    )
-    people = bot.store.people(guild.id, session_ms)
-    if people:
-        lines.append(f"People: {_mentions(people)}")
+    lines.append(f"\n{when} · {human_duration(duration)}")
     if session is None or not session.mix:
-        lines.append("Nothing said yet.")
+        lines.append("No audio.")
         return "\n".join(lines)
 
     text = "\n".join(lines)
-    links = [_link("Everyone", bot.links.session_url(guild.id, session_ms, MIX_TRACK))]
+    links = [_link("All", bot.links.session_url(guild.id, session_ms, MIX_TRACK))]
     for user_id in session.speakers:
         link = _link(
             bot.short_name(guild, user_id),
@@ -133,7 +125,7 @@ class SessionSelect(discord.ui.Select):
     def __init__(self, owner: RecordingsView, ids: list[int]) -> None:
         sessions = {s.session_ms: s for s in owner.bot.store.sessions(owner.guild.id)}
         super().__init__(
-            placeholder="Pick a session",
+            placeholder="Session",
             options=[
                 _option(owner.bot, owner.guild, sid, sessions.get(sid), owner.session_ms)
                 for sid in ids
@@ -149,14 +141,13 @@ class SessionSelect(discord.ui.Select):
 
 class DeleteButton(discord.ui.Button):
     def __init__(self, owner: RecordingsView) -> None:
-        super().__init__(label="Delete session", style=discord.ButtonStyle.danger)
+        super().__init__(label="Delete", style=discord.ButtonStyle.danger)
         self.owner = owner
 
     async def callback(self, interaction: discord.Interaction) -> None:
         confirm = ConfirmDelete(self.owner)
         await interaction.response.edit_message(
-            content=f"Delete the session of {discord_time(self.owner.session_ms, 'f')} "
-            "for everyone? This can't be undone.",
+            content=f"Delete {discord_time(self.owner.session_ms, 'f')}? Permanent.",
             view=confirm,
         )
 
@@ -166,15 +157,15 @@ class ConfirmDelete(discord.ui.View):
         super().__init__(timeout=120)
         self.owner = owner
 
-    @discord.ui.button(label="Delete for good", style=discord.ButtonStyle.danger)
+    @discord.ui.button(label="Delete", style=discord.ButtonStyle.danger)
     async def confirm(self, interaction: discord.Interaction, _button) -> None:
         bot, guild, session_ms = self.owner.bot, self.owner.guild, self.owner.session_ms
         if live_session(bot, guild.id) == session_ms:
-            note = "That session is live again, so I kept it."
+            note = "Live, not deleted."
         else:
             bot.store.delete_session(guild.id, session_ms)
             bot.exporter.forget(guild.id, session_ms)
-            note = f"🗑️ Deleted the session of {discord_time(session_ms, 'f')}."
+            note = f"🗑️ Deleted {discord_time(session_ms, 'f')}."
         ids = session_ids(bot, guild.id)
         view = self.owner.reopen(ids[0] if ids else None)
         await interaction.response.edit_message(content=f"{note}\n{view.content()}", view=view)
@@ -185,7 +176,7 @@ class ConfirmDelete(discord.ui.View):
         await interaction.response.edit_message(content=view.content(), view=view)
 
 
-@app_commands.command(name="recordings", description="Listen to recorded sessions")
+@app_commands.command(name="recordings", description="Sessions and links")
 @app_commands.guild_only()
 async def recordings(interaction: discord.Interaction) -> None:
     bot: RecordingBot = interaction.client
